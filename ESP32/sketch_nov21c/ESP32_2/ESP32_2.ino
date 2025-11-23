@@ -4,9 +4,10 @@
  * 功能：
  * - 每5秒收集一条数据（模拟长度 + 日期时间含时区）
  * - 每条数据均先保存在本地
- * - 只要有网络且本地有数据，持续上传（不受5秒间隔限制）
- * - 严格 FIFO 顺序：先保存的数据先上传，上传成功后立即删除
- * - 每次只上传一条数据，确保数据顺序和可靠性
+ * - 只要有网络且本地有数据，持续批量上传（不受5秒间隔限制）
+ * - 严格 FIFO 顺序：先保存的数据先上传，批量上传成功后批量删除
+ * - 批量上传：每次上传多条数据（默认10条），提高上传效率
+ * - 可靠性保证：如果某条数据上传失败，停止本次批量上传，保留剩余数据等待下次重试
  */
 
 #include <WiFi.h>
@@ -43,6 +44,9 @@ unsigned long lastCollectTime = 0;
 const unsigned long uploadCheckInterval = 500;  // 每0.5秒检查一次是否有数据需要上传
 unsigned long lastUploadCheckTime = 0;
 static bool isUploading = false;  // 上传进行中标志，防止重复触发
+
+// 批量上传配置
+const int BATCH_UPLOAD_SIZE = 50;  // 每次批量上传的数据条数（Django后台支持，可根据需要调整：10-100条）
 
 // 持久化存储配置（使用 LittleFS）
 const char* dataFilePath = "/sensor_data.json";  // 数据文件路径
@@ -355,6 +359,101 @@ void removeFirstDataFromStorage() {
   }
 }
 
+// 从持久化存储批量读取前N条数据（FIFO顺序）
+// 返回实际读取的数据条数
+int readBatchDataFromStorage(float* distances, time_t* timestamps, int maxCount) {
+  if (!LittleFS.exists(dataFilePath)) {
+    return 0;
+  }
+  
+  File file = LittleFS.open(dataFilePath, "r");
+  if (!file) {
+    return 0;
+  }
+  
+  DynamicJsonDocument doc(JSON_DOC_SIZE);
+  DeserializationError error = deserializeJson(doc, file);
+  file.close();
+  
+  if (error) {
+    return 0;
+  }
+  
+  if (!doc.containsKey("a")) {
+    return 0;
+  }
+  
+  JsonArray dataArray = doc["a"].as<JsonArray>();
+  int arraySize = dataArray.size();
+  if (arraySize == 0) {
+    return 0;
+  }
+  
+  // 读取前N条数据（不超过maxCount和实际数组大小）
+  int readCount = (arraySize < maxCount) ? arraySize : maxCount;
+  
+  for (int i = 0; i < readCount; i++) {
+    JsonArray record = dataArray[i];
+    if (record.size() >= 2) {
+      distances[i] = record[0].as<float>();
+      timestamps[i] = (time_t)record[1].as<uint64_t>();
+    } else {
+      // 数据格式错误，返回已读取的数量
+      return i;
+    }
+  }
+  
+  return readCount;
+}
+
+// 从持久化存储批量删除前N条数据（FIFO顺序）
+void removeBatchDataFromStorage(int count) {
+  if (!LittleFS.exists(dataFilePath) || count <= 0) {
+    return;
+  }
+  
+  File file = LittleFS.open(dataFilePath, "r");
+  if (!file) {
+    return;
+  }
+  
+  DynamicJsonDocument doc(JSON_DOC_SIZE);
+  DeserializationError error = deserializeJson(doc, file);
+  file.close();
+  
+  if (error) {
+    return;
+  }
+  
+  // 检查是否有数据
+  if (!doc.containsKey("a")) {
+    return;
+  }
+  
+  JsonArray dataArray = doc["a"].as<JsonArray>();
+  int arraySize = dataArray.size();
+  if (arraySize == 0) {
+    return;
+  }
+  
+  // 删除前N条数据（不超过实际数组大小）
+  int deleteCount = (arraySize < count) ? arraySize : count;
+  
+  for (int i = 0; i < deleteCount; i++) {
+    dataArray.remove(0);
+  }
+  
+  // 使用实际数组大小更新计数器（确保准确性）
+  doc["c"] = dataArray.size();
+  
+  // 保存回文件
+  file = LittleFS.open(dataFilePath, "w");
+  if (file) {
+    serializeJson(doc, file);
+    file.close();
+  }
+}
+
 // 上传单条数据
 bool uploadSingleData(float distanceCm, time_t timestamp) {
   // 检查 WiFi 连接
@@ -430,7 +529,7 @@ bool uploadSingleData(float distanceCm, time_t timestamp) {
   return false;
 }
 
-// 上传本地数据（每次只上传一条最早的数据，严格 FIFO 顺序）
+// 批量上传本地数据（每次上传多条数据，严格 FIFO 顺序）
 void uploadLocalData() {
   // 防止重复触发
   if (isUploading) {
@@ -450,47 +549,88 @@ void uploadLocalData() {
   
   isUploading = true;
   
-  // 读取第一条数据（最早保存的数据，FIFO）
-  float distance;
-  time_t timestamp;
+  // 确定本次批量上传的条数（不超过配置的最大值，也不超过实际存储的数据量）
+  int batchSize = (storedCount < BATCH_UPLOAD_SIZE) ? storedCount : BATCH_UPLOAD_SIZE;
   
-  if (!readFirstDataFromStorage(distance, timestamp)) {
+  // 分配临时数组存储批量数据
+  float* distances = new float[batchSize];
+  time_t* timestamps = new time_t[batchSize];
+  
+  // 批量读取数据
+  int readCount = readBatchDataFromStorage(distances, timestamps, batchSize);
+  
+  if (readCount == 0) {
     // 没有数据了
+    delete[] distances;
+    delete[] timestamps;
     isUploading = false;
     return;
   }
   
-  // 显示上传信息
-  Serial.print("[上传] 正在上传最早的数据: ");
-  Serial.print(distance, 2);
-  Serial.print(" cm");
-  if (timestamp > 0) {
-    Serial.print(", 时间: ");
-    Serial.print(formatDateTime(timestamp));
-  }
-  Serial.print(" (剩余 ");
+  Serial.print("\n[批量上传] 开始上传 ");
+  Serial.print(readCount);
+  Serial.print(" 条数据（剩余 ");
   Serial.print(storedCount);
-  Serial.print(" 条)");
+  Serial.println(" 条）");
   
-  // 尝试上传
-  if (uploadSingleData(distance, timestamp)) {
-    // 上传成功，立即删除这条数据
-    removeFirstDataFromStorage();
-    Serial.println(" ✓ 上传成功，已删除");
-    
-    // 显示剩余数据条数
-    int remainingCount = getStoredDataCount();
-    if (remainingCount > 0) {
-      Serial.print("[上传] 剩余 ");
-      Serial.print(remainingCount);
-      Serial.println(" 条数据待上传");
-    } else {
-      Serial.println("[上传] 所有数据已上传完成");
+  // 逐条上传，记录成功和失败的数量
+  int successCount = 0;
+  int failCount = 0;
+  
+  for (int i = 0; i < readCount; i++) {
+    Serial.print("[上传] 第 ");
+    Serial.print(i + 1);
+    Serial.print("/");
+    Serial.print(readCount);
+    Serial.print(" 条: ");
+    Serial.print(distances[i], 2);
+    Serial.print(" cm");
+    if (timestamps[i] > 0) {
+      Serial.print(", 时间: ");
+      Serial.print(formatDateTime(timestamps[i]));
     }
-  } else {
-    // 上传失败，保留数据，等待下次重试
-    Serial.println(" ✗ 上传失败，保留数据等待下次重试");
+    
+    // 尝试上传
+    if (uploadSingleData(distances[i], timestamps[i])) {
+      successCount++;
+      Serial.println(" ✓ 成功");
+    } else {
+      failCount++;
+      Serial.println(" ✗ 失败");
+      // 如果上传失败，停止后续上传，保留剩余数据等待下次重试
+      Serial.println("[警告] 上传失败，停止本次批量上传，保留剩余数据");
+      break;
+    }
+    
+    // 每条数据之间稍作延时，避免请求过快
+    delay(100);
   }
+  
+  // 删除成功上传的数据（只删除成功上传的部分）
+  if (successCount > 0) {
+    removeBatchDataFromStorage(successCount);
+    Serial.print("[删除] 已删除 ");
+    Serial.print(successCount);
+    Serial.println(" 条已成功上传的数据");
+  }
+  
+  // 释放临时数组
+  delete[] distances;
+  delete[] timestamps;
+  
+  // 显示统计信息
+  int remainingCount = getStoredDataCount();
+  Serial.print("[统计] 本次上传: 成功 ");
+  Serial.print(successCount);
+  Serial.print(" 条");
+  if (failCount > 0) {
+    Serial.print(", 失败 ");
+    Serial.print(failCount);
+    Serial.print(" 条（已保留）");
+  }
+  Serial.print(" | 剩余待上传: ");
+  Serial.print(remainingCount);
+  Serial.println(" 条\n");
   
   isUploading = false;
 }
@@ -559,12 +699,15 @@ void setup() {
   lastUploadCheckTime = 0;
 
   Serial.println("\n[系统] 初始化完成");
-  Serial.println("[模式] 数据收集与上传模式：");
+  Serial.println("[模式] 数据收集与批量上传模式：");
   Serial.println("  ✓ 每5秒收集一条数据（模拟长度 + 日期时间含时区）");
   Serial.println("  ✓ 每条数据均先保存在本地");
-  Serial.println("  ✓ 只要有网络且本地有数据，持续上传（不受5秒间隔限制）");
+  Serial.println("  ✓ 只要有网络且本地有数据，持续批量上传（不受5秒间隔限制）");
   Serial.println("  ✓ 严格 FIFO 顺序：先保存的数据先上传");
-  Serial.println("  ✓ 每次只上传一条数据，上传成功后立即删除");
+  Serial.print("  ✓ 批量上传：每次上传 ");
+  Serial.print(BATCH_UPLOAD_SIZE);
+  Serial.println(" 条数据，提高上传效率");
+  Serial.println("  ✓ 上传成功后批量删除，失败则保留数据等待重试");
   Serial.print("[配置] API Key: ");
   Serial.println(apiKey);
   Serial.print("[配置] 传感器ID: ");
