@@ -178,8 +178,10 @@ bool saveDataToStorage(float distanceCm, time_t timestamp) {
     if (file) {
       DeserializationError error = deserializeJson(doc, file);
       file.close();
-      if (!error) {
-        storedCount = doc["c"].as<int>();
+      if (!error && doc.containsKey("a")) {
+        // 使用实际数组大小，而不是计数器（确保准确性）
+        JsonArray tempArray = doc["a"].as<JsonArray>();
+        storedCount = tempArray.size();
       }
     }
   }
@@ -188,13 +190,15 @@ bool saveDataToStorage(float distanceCm, time_t timestamp) {
   if (!doc.containsKey("a")) {
     doc["c"] = 0;
     doc["a"] = JsonArray();
+    storedCount = 0;
   }
   
   // 检查可用堆内存，如果低于阈值则删除最旧的数据（FIFO）
   size_t freeHeap = ESP.getFreeHeap();
   int deletedCount = 0;
   
-  while (freeHeap < minFreeHeap && storedCount > 0) {
+  JsonArray dataArray = doc["a"].as<JsonArray>();
+  while (freeHeap < minFreeHeap && dataArray.size() > 0) {
     if (deletedCount == 0) {
       Serial.print("[警告] 可用内存不足 (");
       Serial.print(freeHeap);
@@ -204,12 +208,9 @@ bool saveDataToStorage(float distanceCm, time_t timestamp) {
     }
     
     // 删除最旧的数据（数组第一个元素）
-    JsonArray dataArray = doc["a"].as<JsonArray>();
-    if (dataArray.size() > 0) {
-      dataArray.remove(0);
-      storedCount--;
-      deletedCount++;
-    }
+    dataArray.remove(0);
+    storedCount--;
+    deletedCount++;
     
     // 再次检查内存
     freeHeap = ESP.getFreeHeap();
@@ -226,11 +227,11 @@ bool saveDataToStorage(float distanceCm, time_t timestamp) {
   }
   
   // 添加新数据（使用数组格式以节省空间：[distance, timestamp]）
-  JsonArray dataArray = doc["a"].to<JsonArray>();
   JsonArray newRecord = dataArray.createNestedArray();
   newRecord.add(distanceCm);
   newRecord.add((uint64_t)timestamp);
-  doc["c"] = storedCount + 1;
+  // 使用实际数组大小更新计数器（确保准确性）
+  doc["c"] = dataArray.size();
   
   // 保存到文件
   File file = LittleFS.open(dataFilePath, "w");
@@ -245,7 +246,7 @@ bool saveDataToStorage(float distanceCm, time_t timestamp) {
   return true;
 }
 
-// 获取持久化存储中的数据条数
+// 获取持久化存储中的数据条数（返回实际数组大小，确保准确性）
 int getStoredDataCount() {
   if (!LittleFS.exists(dataFilePath)) {
     return 0;
@@ -264,7 +265,13 @@ int getStoredDataCount() {
     return 0;
   }
   
-  return doc["c"].as<int>();
+  // 返回实际数组大小，而不是计数器（确保准确性）
+  if (doc.containsKey("a")) {
+    JsonArray dataArray = doc["a"].as<JsonArray>();
+    return dataArray.size();
+  }
+  
+  return 0;
 }
 
 // 从持久化存储读取第一条数据（最早的数据）
@@ -325,18 +332,20 @@ void removeFirstDataFromStorage() {
     return;
   }
   
-  int storedCount = doc["c"].as<int>();
+  // 检查是否有数据
+  if (!doc.containsKey("a")) {
+    return;
+  }
   
-  if (storedCount <= 0) {
+  JsonArray dataArray = doc["a"].as<JsonArray>();
+  if (dataArray.size() == 0) {
     return;
   }
   
   // 删除第一条数据
-  JsonArray dataArray = doc["a"].as<JsonArray>();
-  if (dataArray.size() > 0) {
-    dataArray.remove(0);
-    doc["c"] = storedCount - 1;
-  }
+  dataArray.remove(0);
+  // 使用实际数组大小更新计数器（确保准确性）
+  doc["c"] = dataArray.size();
   
   // 保存回文件
   file = LittleFS.open(dataFilePath, "w");
