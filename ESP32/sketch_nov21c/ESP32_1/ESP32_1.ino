@@ -1,9 +1,10 @@
 /*
- * ESP32 模拟数据上传到后台（带本地缓存）
+ * ESP32 模拟数据上传到后台（实时上传模式）
  * ----------------------------------------
  * 功能：
- * - 连接 WiFi 并定期收集模拟超声波数据
- * - 本地存储10条数据后批量上传
+ * - 连接 WiFi 并每5秒收集一次模拟超声波数据
+ * - 有网络时立即上传数据到后台
+ * - 网络不可用时保存到本地作为备份
  * - 简化代码，避免卡顿
  */
 
@@ -26,8 +27,8 @@ const char* password = "18621260183";
 // API 配置（与 test_1.ino 保持一致）
 // 本地测试地址：http://192.168.100.193:8001/api
 // 生产环境地址：https://manage.gogotrans.com/api
-// const char* apiBaseUrl = "http://192.168.100.193:8001/api";  // 本地测试地址
-const char* apiBaseUrl = "https://manage.gogotrans.com/api";  // 生产环境地址
+const char* apiBaseUrl = "http://192.168.100.193:8001/api";  // 本地测试地址
+// const char* apiBaseUrl = "https://manage.gogotrans.com/api";  // 生产环境地址
 const char* apiKey = "mcu_8312592b29fd4c68a0e01336cf26f438";
 const char ultrasonicSensorId[] = "8ea58210-c649-11f0-afa3-da038af01e18";
 
@@ -38,13 +39,13 @@ const int daylightOffset_sec = 0;     // 夏令时偏移（中国不使用夏令
 bool timeSynced = false;              // 时间是否已同步
 
 // 数据收集间隔（毫秒）
-const unsigned long collectInterval = 200;  // 每0.2秒收集一条数据
+const unsigned long collectInterval = 5000;  // 每5秒收集一条数据
 unsigned long lastCollectTime = 0;
 
-// 批量上传间隔（毫秒）
-const unsigned long uploadInterval = 3600000;  // 每1小时（3600秒）上传一次
-unsigned long lastUploadTime = 0;  // 上次上传时间
-bool uploadScheduled = false;  // 是否已安排上传
+// 批量上传间隔（毫秒）- 有网络时持续上传历史数据
+const unsigned long batchUploadInterval = 1000;  // 每1秒检查一次是否有历史数据需要上传
+unsigned long lastBatchUploadTime = 0;
+static bool isBatchUploading = false;  // 批量上传进行中标志，防止重复触发
 
 // 数据结构：存储距离和时间戳
 struct DataRecord {
@@ -109,17 +110,26 @@ void syncNTPTime() {
   }
   
   Serial.println("[时间] 正在同步 NTP 时间...");
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  Serial.print("[时间] NTP 服务器: ");
+  Serial.println(ntpServer);
+  
+  // 配置时间（ESP32支持多个NTP服务器作为备用）
+  // 如果第一个服务器失败，会自动尝试其他服务器
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer, "time.nist.gov", "time.google.com");
   
   // 等待时间同步（最多等待10秒）
   int attempts = 0;
-  while (time(nullptr) < 1000000000 && attempts < 20) {
+  time_t now = 0;
+  while (attempts < 20) {
     delay(500);
     yield();
+    now = time(nullptr);
+    if (now > 1000000000) {
+      break;  // 时间同步成功
+    }
     attempts++;
   }
   
-  time_t now = time(nullptr);
   if (now > 1000000000) {
     timeSynced = true;
     struct tm timeinfo;
@@ -137,7 +147,12 @@ void syncNTPTime() {
     Serial.print(":");
     Serial.println(timeinfo.tm_sec);
   } else {
-    Serial.println("[时间] ✗ 时间同步失败");
+    Serial.print("[时间] ✗ 时间同步失败 (尝试了 ");
+    Serial.print(attempts);
+    Serial.print(" 次，当前时间戳: ");
+    Serial.print(now);
+    Serial.println(")");
+    Serial.println("[时间] 提示: 请检查网络连接和NTP服务器可访问性");
     timeSynced = false;
   }
 }
@@ -367,7 +382,7 @@ int loadDataFromStorage() {
   return dataCount;
 }
 
-// 从持久化存储删除已上传的数据
+// 从持久化存储删除已上传的数据（从开头删除指定数量）
 void removeDataFromStorage(int count) {
   if (count <= 0) return;
   
@@ -404,6 +419,63 @@ void removeDataFromStorage(int count) {
     }
     doc["c"] = storedCount - count;
   }
+  
+  // 保存回文件
+  file = LittleFS.open(dataFilePath, "w");
+  if (file) {
+    serializeJson(doc, file);
+    file.close();
+  }
+}
+
+// 从持久化存储删除指定索引的数据（按索引从大到小删除，避免索引变化）
+void removeDataFromStorageByIndices(int* indices, int count) {
+  if (count <= 0 || indices == nullptr) return;
+  
+  if (!LittleFS.exists(dataFilePath)) {
+    return;
+  }
+  
+  File file = LittleFS.open(dataFilePath, "r");
+  if (!file) {
+    return;
+  }
+  
+  DynamicJsonDocument doc(JSON_DOC_SIZE);
+  DeserializationError error = deserializeJson(doc, file);
+  file.close();
+  
+  if (error) {
+    Serial.print("[错误] JSON 解析失败: ");
+    Serial.println(error.c_str());
+    return;
+  }
+  
+  JsonArray dataArray = doc["a"].as<JsonArray>();
+  
+  // 对索引进行排序（从大到小），这样删除时索引不会变化
+  for (int i = 0; i < count - 1; i++) {
+    for (int j = 0; j < count - i - 1; j++) {
+      if (indices[j] < indices[j + 1]) {
+        int temp = indices[j];
+        indices[j] = indices[j + 1];
+        indices[j + 1] = temp;
+      }
+    }
+  }
+  
+  // 从后往前删除（从索引大的开始删除）
+  int actualDeleted = 0;
+  for (int i = 0; i < count; i++) {
+    int idx = indices[i];
+    if (idx >= 0 && idx < dataArray.size()) {
+      dataArray.remove(idx);
+      actualDeleted++;
+    }
+  }
+  
+  int storedCount = doc["c"].as<int>();
+  doc["c"] = (storedCount > actualDeleted) ? (storedCount - actualDeleted) : 0;
   
   // 保存回文件
   file = LittleFS.open(dataFilePath, "w");
@@ -511,8 +583,15 @@ void storeDataLocally(float distanceCm, time_t timestamp) {
   }
 }
 
-// 批量上传数据（从持久化存储读取）
+// 批量上传数据（从持久化存储读取，按时间戳排序，最早的数据优先上传）
 bool uploadBatchData() {
+  // 防止重复触发
+  if (isBatchUploading) {
+    return false;
+  }
+  
+  isBatchUploading = true;
+  
   // 从持久化存储获取数据条数
   int storedCount = getStoredDataCount();
   
@@ -521,29 +600,37 @@ bool uploadBatchData() {
     // 清空内存缓存（以防不一致）
     bufferIndex = 0;
     dataCount = 0;
+    isBatchUploading = false;
     return false;
   }
 
   Serial.println("\n========== 开始批量上传 ==========");
   Serial.print("[信息] 准备上传 ");
   Serial.print(storedCount);
-  Serial.println(" 条数据（从持久化存储）");
+  Serial.println(" 条数据（从持久化存储，按时间排序）");
   
   // 检查 WiFi 连接
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[错误] WiFi 未连接，无法上传");
+    isBatchUploading = false;
     return false;
   }
 
-  int successCount = 0;
-  int failCount = 0;
-
-  // 从持久化存储逐条读取并上传
+  // 从持久化存储读取所有数据
   File file = LittleFS.open(dataFilePath, "r");
   if (!file) {
     Serial.println("[错误] 无法打开数据文件");
+    isBatchUploading = false;
     return false;
   }
+  
+  // 检查文件大小
+  size_t fileSize = file.size();
+  Serial.print("[调试] 数据文件大小: ");
+  Serial.print(fileSize);
+  Serial.print(" 字节 (");
+  Serial.print(fileSize / 1024.0, 2);
+  Serial.println(" KB)");
   
   DynamicJsonDocument doc(JSON_DOC_SIZE);
   DeserializationError error = deserializeJson(doc, file);
@@ -552,36 +639,238 @@ bool uploadBatchData() {
   if (error) {
     Serial.print("[错误] JSON 解析失败: ");
     Serial.println(error.c_str());
+    Serial.print("[错误] 错误代码: ");
+    Serial.println((int)error.code());
+    Serial.print("[错误] 错误位置: ");
+    Serial.println(error.offset());
+    isBatchUploading = false;
+    return false;
+  }
+  
+  // 检查 JSON 文档结构
+  Serial.print("[调试] JSON 文档容量: ");
+  Serial.print(doc.capacity());
+  Serial.print(" 字节 (");
+  Serial.print(doc.capacity() / 1024.0, 2);
+  Serial.println(" KB)");
+  Serial.print("[调试] JSON 文档内存使用: ");
+  Serial.print(doc.memoryUsage());
+  Serial.print(" 字节 (");
+  Serial.print(doc.memoryUsage() / 1024.0, 2);
+  Serial.println(" KB)");
+  
+  // 检查是否包含 "a" 字段
+  if (!doc.containsKey("a")) {
+    Serial.println("[错误] JSON 文档中不存在 'a' 字段！");
+    Serial.print("[调试] JSON 文档包含的键: ");
+    for (JsonPair kv : doc.as<JsonObject>()) {
+      Serial.print(kv.key().c_str());
+      Serial.print(" ");
+    }
+    Serial.println();
+    isBatchUploading = false;
+    return false;
+  }
+  
+  // 检查 "a" 字段的类型
+  if (!doc["a"].is<JsonArray>()) {
+    Serial.print("[错误] 'a' 字段不是数组类型！实际类型: ");
+    if (doc["a"].is<JsonObject>()) Serial.println("对象");
+    else if (doc["a"].is<const char*>()) Serial.println("字符串");
+    else if (doc["a"].is<int>()) Serial.println("整数");
+    else if (doc["a"].is<float>()) Serial.println("浮点数");
+    else if (doc["a"].is<bool>()) Serial.println("布尔值");
+    else if (doc["a"].is<nullptr_t>()) Serial.println("null");
+    else Serial.println("未知类型");
+    isBatchUploading = false;
     return false;
   }
   
   JsonArray dataArray = doc["a"].as<JsonArray>();
   
+  // 添加调试信息：检查 JSON 结构
+  int jsonCount = doc["c"].as<int>();
+  int actualArraySize = dataArray.size();
+  Serial.print("[调试] JSON 文档中记录的数量 (c): ");
+  Serial.println(jsonCount);
+  Serial.print("[调试] JSON 数据数组实际大小: ");
+  Serial.println(actualArraySize);
+  
+  // 检查一致性
+  if (jsonCount != actualArraySize) {
+    Serial.print("[警告] 数据不一致！JSON 计数 (c)=");
+    Serial.print(jsonCount);
+    Serial.print(", 实际数组大小=");
+    Serial.println(actualArraySize);
+    Serial.println("[警告] 将使用实际数组大小进行处理");
+    
+    // 如果数组大小为 0，尝试检查 JSON 文档是否溢出
+    if (actualArraySize == 0 && jsonCount > 0) {
+      Serial.println("[错误] ⚠️ 严重问题：数组大小为 0 但计数不为 0！");
+      Serial.println("[错误] 可能原因：");
+      Serial.println("[错误] 1. JSON 文档容量不足，解析时被截断");
+      Serial.println("[错误] 2. JSON 文档损坏");
+      Serial.println("[错误] 3. 内存不足导致解析失败");
+      Serial.print("[错误] 建议：增加 JSON_DOC_SIZE 到至少 ");
+      Serial.print((fileSize * 1.2) / 1024.0, 0);
+      Serial.println(" KB");
+      isBatchUploading = false;
+      return false;
+    }
+  }
+  
+  // 将所有数据读取到临时数组，并记录原始索引
+  const int maxRecords = dataArray.size();
+  DataRecord* records = new DataRecord[maxRecords];
+  int* originalIndices = new int[maxRecords];
+  int validCount = 0;
+  int skippedCount = 0;
+  int invalidFormatCount = 0;
+  
   for (int i = 0; i < dataArray.size(); i++) {
     JsonArray record = dataArray[i];
-    if (record.size() < 2) continue;
+    if (record.size() < 2) {
+      // 数据格式不正确，跳过
+      invalidFormatCount++;
+      if (invalidFormatCount <= 3) {
+        Serial.print("[调试] 记录 [");
+        Serial.print(i);
+        Serial.print("] 格式不正确，大小: ");
+        Serial.println(record.size());
+      }
+      continue;
+    }
     float dist = record[0].as<float>();
     time_t ts = (time_t)record[1].as<uint64_t>();
     
-    if (dist == 0 && ts == 0) {
-      // 跳过无效数据
-      continue;
+    // 验证数据有效性：距离或时间戳至少有一个不为0（与loadDataFromStorage逻辑一致）
+    if (dist > 0 || ts > 0) {
+      records[validCount].distance = dist;
+      records[validCount].timestamp = ts;
+      originalIndices[validCount] = i;
+      validCount++;
+    } else {
+      // 如果 dist == 0 && ts == 0，跳过这条无效数据
+      skippedCount++;
+      if (skippedCount <= 3) {
+        Serial.print("[调试] 记录 [");
+        Serial.print(i);
+        Serial.print("] 无效 (dist=0 && ts=0): dist=");
+        Serial.print(dist, 2);
+        Serial.print(", ts=");
+        Serial.println(ts);
+      }
     }
+  }
+  
+  // 输出统计信息
+  Serial.print("[调试] 总记录数: ");
+  Serial.print(dataArray.size());
+  Serial.print(", 有效记录数: ");
+  Serial.print(validCount);
+  Serial.print(", 格式错误: ");
+  Serial.print(invalidFormatCount);
+  Serial.print(", 无效数据 (dist=0 && ts=0): ");
+  Serial.println(skippedCount);
+  
+  // 如果有效数据为0，输出前几条数据的详细信息
+  if (validCount == 0 && dataArray.size() > 0) {
+    Serial.println("[调试] 详细检查前10条数据:");
+    for (int i = 0; i < min(10, (int)dataArray.size()); i++) {
+      JsonArray record = dataArray[i];
+      Serial.print("  [");
+      Serial.print(i);
+      Serial.print("] 记录大小: ");
+      Serial.print(record.size());
+      if (record.size() >= 2) {
+        float dist = record[0].as<float>();
+        time_t ts = (time_t)record[1].as<uint64_t>();
+        Serial.print(", dist=");
+        Serial.print(dist, 2);
+        Serial.print(", ts=");
+        Serial.print(ts);
+        Serial.print(", 验证结果: ");
+        if (dist > 0 || ts > 0) {
+          Serial.println("有效");
+        } else {
+          Serial.println("无效 (dist=0 && ts=0)");
+        }
+      } else {
+        Serial.println(", 格式错误");
+      }
+    }
+  }
+  
+  // 按时间戳排序（最早的数据在前）
+  // 排序规则：时间戳为0的数据视为最旧，排在最前面；其他数据按时间戳升序排列
+  Serial.println("[排序] 正在按时间戳排序数据（最早优先）...");
+  for (int i = 0; i < validCount - 1; i++) {
+    for (int j = 0; j < validCount - i - 1; j++) {
+      time_t ts1 = records[j].timestamp;
+      time_t ts2 = records[j + 1].timestamp;
+      
+      bool needSwap = false;
+      
+      // 处理时间戳为0的情况：0视为最旧
+      if (ts1 == 0 && ts2 == 0) {
+        // 两个都是0，保持原顺序（稳定排序）
+        needSwap = false;
+      } else if (ts1 == 0) {
+        // ts1是0，应该排在最前面，不需要交换
+        needSwap = false;
+      } else if (ts2 == 0) {
+        // ts2是0，应该排在最前面，需要交换
+        needSwap = true;
+      } else {
+        // 两个都不是0，按时间戳大小比较
+        needSwap = (ts1 > ts2);
+      }
+      
+      if (needSwap) {
+        // 交换数据记录
+        DataRecord temp = records[j];
+        records[j] = records[j + 1];
+        records[j + 1] = temp;
+        
+        // 交换原始索引
+        int tempIdx = originalIndices[j];
+        originalIndices[j] = originalIndices[j + 1];
+        originalIndices[j + 1] = tempIdx;
+      }
+    }
+  }
+  
+  Serial.print("[排序] 排序完成，共 ");
+  Serial.print(validCount);
+  Serial.println(" 条有效数据");
+  
+  // 按排序后的顺序上传数据，并记录已上传成功的原始索引
+  int successCount = 0;
+  int failCount = 0;
+  int* uploadedIndices = new int[validCount];  // 记录已上传成功的原始索引
+  
+  for (int i = 0; i < validCount; i++) {
+    float dist = records[i].distance;
+    time_t ts = records[i].timestamp;
     
     Serial.print("\n[上传] 第 ");
     Serial.print(i + 1);
     Serial.print("/");
-    Serial.print(storedCount);
-    Serial.print(" 条数据: ");
+    Serial.print(validCount);
+    Serial.print(" 条数据（时间排序后）: ");
     Serial.print(dist, 2);
     Serial.print(" cm");
     if (ts > 0) {
       Serial.print(", 时间: ");
       Serial.print(formatDateTime(ts));
+    } else {
+      Serial.print(", 时间: (未同步)");
     }
     Serial.println();
     
     if (uploadSingleData(dist, ts)) {
+      // 记录已上传成功的原始索引
+      uploadedIndices[successCount] = originalIndices[i];
       successCount++;
     } else {
       failCount++;
@@ -592,10 +881,18 @@ bool uploadBatchData() {
     delay(200);  // 每条数据之间稍作延时
   }
   
-  // 删除已成功上传的数据
+  // 删除已成功上传的数据（根据原始索引精确删除）
   if (successCount > 0) {
-    removeDataFromStorage(successCount);
+    Serial.print("[删除] 正在删除 ");
+    Serial.print(successCount);
+    Serial.println(" 条已上传的数据...");
+    removeDataFromStorageByIndices(uploadedIndices, successCount);
   }
+  
+  // 释放临时数组
+  delete[] records;
+  delete[] originalIndices;
+  delete[] uploadedIndices;
 
   // 清空内存缓存（保持一致性）
   bufferIndex = 0;
@@ -616,6 +913,7 @@ bool uploadBatchData() {
   Serial.println(" 条");
   Serial.println("========================================\n");
   
+  isBatchUploading = false;
   return (failCount == 0);
 }
 
@@ -934,16 +1232,15 @@ void setup() {
     Serial.println("[系统] WiFi 未连接，数据将先存储在本地");
   }
 
-  // 初始化数据收集时间和上传时间
+  // 初始化数据收集时间
   lastCollectTime = 0;  // 立即开始第一次数据收集
-  lastUploadTime = millis();  // 初始化上传定时器（从现在开始计时1小时）
 
   Serial.println("\n[系统] 初始化完成");
-  Serial.println("[模式] 定时批量上传模式：");
-  Serial.println("  ✓ 每0.2秒收集一条数据并保存到本地");
-  Serial.println("  ✓ 每1小时自动批量上传所有本地数据到后台");
+  Serial.println("[模式] 实时上传模式：");
+  Serial.println("  ✓ 每5秒收集一条数据");
+  Serial.println("  ✓ 有网络时立即上传到后台");
+  Serial.println("  ✓ 网络不可用时保存到本地（作为备份）");
   Serial.println("  ✓ 数据保存在持久化存储（断电不丢失）");
-  Serial.println("  ✓ 如果上传时网络不可用，数据将继续保存在本地");
   Serial.println("[数据] 模拟距离值：随机生成 40.0~80.0 cm");
   Serial.println("[字段] 距离值将保存到后台 currentDistance 字段");
   Serial.println("[字段] 数据获取时间将保存到后台 dataUpdatedAt 字段");
@@ -1105,11 +1402,6 @@ void setup() {
   Serial.print(" 毫秒 (");
   Serial.print(collectInterval / 1000.0, 1);
   Serial.println(" 秒)");
-  Serial.print("[配置] 批量上传间隔: ");
-  Serial.print(uploadInterval / 1000);
-  Serial.print(" 秒 (");
-  Serial.print(uploadInterval / 1000.0 / 60.0, 1);
-  Serial.println(" 分钟)");
   Serial.print("[配置] 预计每小时收集数据: ");
   Serial.print((3600.0 * 1000.0 / collectInterval));
   Serial.println(" 条");
@@ -1123,23 +1415,20 @@ void loop() {
   static bool wasConnected = false;
   bool isConnected = (WiFi.status() == WL_CONNECTED);
   
-  // 如果 WiFi 从断开变为连接，同步时间（但不立即上传，等待定时上传）
+  // 如果 WiFi 从断开变为连接，同步时间并尝试上传历史数据
   if (isConnected && !wasConnected) {
     Serial.println("\n[网络] WiFi 已恢复连接");
     // 同步时间
     if (!timeSynced) {
       syncNTPTime();
     }
-    // 显示本地数据统计
+    // 显示本地数据统计并尝试上传历史数据
     int storedCount = getStoredDataCount();
     if (storedCount > 0) {
       Serial.print("[网络] 本地存储了 ");
       Serial.print(storedCount);
-      Serial.print(" 条数据，将在 ");
-      unsigned long elapsed = now - lastUploadTime;
-      unsigned long timeUntilUpload = (elapsed >= uploadInterval) ? 0 : (uploadInterval - elapsed);
-      Serial.print(timeUntilUpload / 1000);
-      Serial.println(" 秒后自动上传");
+      Serial.println(" 条历史数据，开始上传...");
+      uploadBatchData();
     }
   }
   
@@ -1159,30 +1448,23 @@ void loop() {
   
   wasConnected = isConnected;
 
-  // 检查是否到了1小时上传时间
-  if (now - lastUploadTime >= uploadInterval) {
-    lastUploadTime = now;
-    
-    // 检查是否有数据需要上传
-    int storedCount = getStoredDataCount();
-    if (storedCount > 0) {
-      Serial.println("\n[定时上传] 1小时已到，开始批量上传...");
-      if (isConnected) {
-        // 同步时间
-        if (!timeSynced) {
-          syncNTPTime();
-        }
+  // 如果有网络连接，持续检查并上传历史数据（每1秒检查一次）
+  if (isConnected && !isBatchUploading) {
+    if (now - lastBatchUploadTime >= batchUploadInterval) {
+      lastBatchUploadTime = now;
+      
+      // 检查是否有历史数据需要上传
+      int storedCount = getStoredDataCount();
+      if (storedCount > 0) {
+        Serial.print("\n[批量上传] 检测到 ");
+        Serial.print(storedCount);
+        Serial.println(" 条历史数据，开始上传...");
         uploadBatchData();
-      } else {
-        Serial.println("[定时上传] WiFi 未连接，跳过本次上传");
-        Serial.println("[定时上传] 数据将继续保存在本地，等待下次上传");
       }
-    } else {
-      Serial.println("[定时上传] 1小时已到，但本地无数据需要上传");
     }
   }
 
-  // 周期性收集数据（每0.2秒收集一条）
+  // 周期性收集数据（每5秒收集一条）
   if (now - lastCollectTime >= collectInterval) {
     lastCollectTime = now;
     
@@ -1192,26 +1474,57 @@ void loop() {
     // 获取当前时间戳
     time_t currentTimestamp = getCurrentTimestamp();
     
-    // 所有数据都保存到本地，等待1小时后批量上传
-    storeDataLocally(simulatedDistance, currentTimestamp);
+    // 如果有网络，立即尝试上传
+    if (isConnected) {
+      // 同步时间（如果需要）
+      if (!timeSynced) {
+        syncNTPTime();
+      }
+      
+      // 立即尝试上传
+      Serial.print("\n[数据] 距离: ");
+      Serial.print(simulatedDistance, 2);
+      Serial.print(" cm");
+      if (currentTimestamp > 0) {
+        Serial.print(", 时间: ");
+        Serial.print(formatDateTime(currentTimestamp));
+      }
+      Serial.println();
+      
+      if (uploadSingleData(simulatedDistance, currentTimestamp)) {
+        Serial.println("[成功] ✓ 数据已实时上传到后台");
+      } else {
+        // 上传失败，保存到本地作为备份
+        Serial.println("[警告] 上传失败，保存到本地作为备份");
+        storeDataLocally(simulatedDistance, currentTimestamp);
+      }
+    } else {
+      // 没有网络，保存到本地
+      Serial.print("\n[数据] 距离: ");
+      Serial.print(simulatedDistance, 2);
+      Serial.print(" cm");
+      if (currentTimestamp > 0) {
+        Serial.print(", 时间: ");
+        Serial.print(formatDateTime(currentTimestamp));
+      }
+      Serial.println(" (网络不可用，已保存到本地)");
+      storeDataLocally(simulatedDistance, currentTimestamp);
+    }
     
-    // 每100条数据输出一次统计信息
+    // 每20条数据输出一次统计信息
     static int collectCount = 0;
     collectCount++;
-    if (collectCount % 100 == 0) {
+    if (collectCount % 20 == 0) {
       int storedCount = getStoredDataCount();
-      unsigned long elapsed = now - lastUploadTime;
-      unsigned long timeUntilUpload = (elapsed >= uploadInterval) ? 0 : (uploadInterval - elapsed);
       Serial.print("\n[统计] 已收集 ");
       Serial.print(collectCount);
-      Serial.print(" 条数据，本地存储: ");
-      Serial.print(storedCount);
-      Serial.print(" 条");
-      Serial.print("，距离下次上传还有: ");
-      Serial.print(timeUntilUpload / 1000);
-      Serial.print(" 秒 (");
-      Serial.print(timeUntilUpload / 60000.0, 1);
-      Serial.println(" 分钟)");
+      Serial.print(" 条数据");
+      if (storedCount > 0) {
+        Serial.print("，本地备份: ");
+        Serial.print(storedCount);
+        Serial.print(" 条");
+      }
+      Serial.println();
     }
   }
 
