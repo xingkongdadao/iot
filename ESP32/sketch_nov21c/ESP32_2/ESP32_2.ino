@@ -3,10 +3,13 @@
  * ----------------------------------------
  * 功能：
  * - 每5秒收集一条数据（模拟长度 + 日期时间含时区）
- * - 每条数据均先保存在本地
+ * - 智能上传策略：
+ *   * 如果本地没有待上传数据且网络正常，优先直接上传到后台（不保存到本地）
+ *   * 如果本地有待上传数据或网络不可用，则保存到本地
+ *   * 直接上传失败时，自动保存到本地等待后续上传
  * - 只要有网络且本地有数据，持续批量上传（不受5秒间隔限制）
  * - 严格 FIFO 顺序：先保存的数据先上传，批量上传成功后批量删除
- * - 批量上传：每次上传多条数据（默认10条），提高上传效率
+ * - 批量上传：每次上传多条数据（默认50条），提高上传效率
  * - 可靠性保证：如果某条数据上传失败，停止本次批量上传，保留剩余数据等待下次重试
  */
 
@@ -699,9 +702,12 @@ void setup() {
   lastUploadCheckTime = 0;
 
   Serial.println("\n[系统] 初始化完成");
-  Serial.println("[模式] 数据收集与批量上传模式：");
+  Serial.println("[模式] 数据收集与智能上传模式：");
   Serial.println("  ✓ 每5秒收集一条数据（模拟长度 + 日期时间含时区）");
-  Serial.println("  ✓ 每条数据均先保存在本地");
+  Serial.println("  ✓ 智能上传策略：");
+  Serial.println("    - 本地无待上传数据且网络正常 → 直接上传（不保存本地）");
+  Serial.println("    - 本地有待上传数据或网络不可用 → 保存到本地");
+  Serial.println("    - 直接上传失败 → 自动保存到本地等待后续上传");
   Serial.println("  ✓ 只要有网络且本地有数据，持续批量上传（不受5秒间隔限制）");
   Serial.println("  ✓ 严格 FIFO 顺序：先保存的数据先上传");
   Serial.print("  ✓ 批量上传：每次上传 ");
@@ -770,7 +776,6 @@ void loop() {
       currentTimestamp = getCurrentTimestamp();
     }
     
-    // 保存到本地（每条数据都先保存）
     Serial.print("\n[收集] 距离: ");
     Serial.print(simulatedDistance, 2);
     Serial.print(" cm");
@@ -781,25 +786,60 @@ void loop() {
       Serial.print(", 时间: (未同步)");
     }
     
-    if (saveDataToStorage(simulatedDistance, currentTimestamp)) {
-      Serial.print(" ✓ 已保存到本地");
-      Serial.print(" (本地共 ");
-      Serial.print(getStoredDataCount());
-      Serial.print(" 条)");
+    // 检查本地是否有待上传的数据
+    int storedCount = getStoredDataCount();
+    bool hasPendingData = (storedCount > 0);
+    
+    // 如果本地没有待上传数据且网络正常，优先直接上传
+    if (!hasPendingData && isConnected && !isUploading) {
+      Serial.print(" | 本地无待上传数据，尝试直接上传...");
+      
+      // 尝试直接上传
+      if (uploadSingleData(simulatedDistance, currentTimestamp)) {
+        Serial.println(" ✓ 直接上传成功（未保存到本地）");
+      } else {
+        // 上传失败，保存到本地
+        Serial.print(" ✗ 直接上传失败，保存到本地");
+        if (saveDataToStorage(simulatedDistance, currentTimestamp)) {
+          Serial.print(" ✓ 已保存");
+          Serial.print(" (本地共 ");
+          Serial.print(getStoredDataCount());
+          Serial.print(" 条)");
+        } else {
+          Serial.print(" ✗ 保存失败");
+        }
+        Serial.println();
+      }
     } else {
-      Serial.print(" ✗ 保存失败");
+      // 本地有待上传数据或网络不可用，保存到本地（保持原有逻辑）
+      if (hasPendingData) {
+        Serial.print(" | 本地有待上传数据，保存到本地");
+      } else if (!isConnected) {
+        Serial.print(" | 网络不可用，保存到本地");
+      } else {
+        Serial.print(" | 上传进行中，保存到本地");
+      }
+      
+      if (saveDataToStorage(simulatedDistance, currentTimestamp)) {
+        Serial.print(" ✓ 已保存");
+        Serial.print(" (本地共 ");
+        Serial.print(getStoredDataCount());
+        Serial.print(" 条)");
+      } else {
+        Serial.print(" ✗ 保存失败");
+      }
+      Serial.println();
     }
-    Serial.println();
     
     // 每20条数据输出一次统计信息
     static int collectCount = 0;
     collectCount++;
     if (collectCount % 20 == 0) {
-      int storedCount = getStoredDataCount();
+      int currentStoredCount = getStoredDataCount();
       Serial.print("\n[统计] 已收集 ");
       Serial.print(collectCount);
       Serial.print(" 条数据，本地存储: ");
-      Serial.print(storedCount);
+      Serial.print(currentStoredCount);
       Serial.println(" 条");
     }
   }
