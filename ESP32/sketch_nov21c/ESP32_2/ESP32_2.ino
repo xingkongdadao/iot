@@ -28,7 +28,7 @@ const char* password = "18621260183";
 // API 配置（与 ESP32_1.ino 保持一致）
 // 本地测试地址：http://192.168.100.193:8001/api
 // 生产环境地址：https://manage.gogotrans.com/api
-const char* apiBaseUrl = "http://192.168.100.193:8001/api";  // 本地测试地址
+const char* apiBaseUrl = "http://192.168.100.192:8001/api";  // 本地测试地址
 // const char* apiBaseUrl = "https://manage.gogotrans.com/api";  // 生产环境地址
 const char* apiKey = "mcu_8312592b29fd4c68a0e01336cf26f438";
 const char ultrasonicSensorId[] = "8ea58210-c649-11f0-afa3-da038af01e18";
@@ -194,9 +194,11 @@ bool saveDataToStorage(float distanceCm, time_t timestamp) {
   }
   
   // 如果文件不存在或解析失败，初始化 JSON 结构
-  if (!doc.containsKey("a")) {
+  JsonArray dataArray = doc["a"].as<JsonArray>();
+  if (dataArray.isNull()) {
+    doc.remove("a");
+    dataArray = doc.createNestedArray("a");
     doc["c"] = 0;
-    doc["a"] = JsonArray();
     storedCount = 0;
   }
   
@@ -204,7 +206,6 @@ bool saveDataToStorage(float distanceCm, time_t timestamp) {
   size_t freeHeap = ESP.getFreeHeap();
   int deletedCount = 0;
   
-  JsonArray dataArray = doc["a"].as<JsonArray>();
   while (freeHeap < minFreeHeap && dataArray.size() > 0) {
     if (deletedCount == 0) {
       Serial.print("[警告] 可用内存不足 (");
@@ -264,7 +265,7 @@ int getStoredDataCount() {
     return 0;
   }
   
-  DynamicJsonDocument doc(2048);
+  DynamicJsonDocument doc(JSON_DOC_SIZE);
   DeserializationError error = deserializeJson(doc, file);
   file.close();
   
@@ -522,12 +523,20 @@ bool uploadSingleData(float distanceCm, time_t timestamp) {
   http.addHeader("Connection", "close");
   
   int httpCode = http.PATCH(payload);
+  // 记录错误字符串以便在 http.end() 后仍可打印
+  String httpError = http.errorToString(httpCode);
   http.end();
 
   // 判断是否成功
   if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_NO_CONTENT || httpCode == 200 || httpCode == 204) {
     return true;
   }
+  
+  Serial.print("[HTTP] 上传失败，状态码: ");
+  Serial.print(httpCode);
+  Serial.print(" (");
+  Serial.print(httpError);
+  Serial.println(")");
   
   return false;
 }
