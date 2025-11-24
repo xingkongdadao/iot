@@ -51,7 +51,7 @@ void sent_sms() {
 void get_gps_data() {
     // Bật GPS
     sim_at_cmd("AT+QGPS=1"); // 打开 GNSS 引擎
-    delay(10000); // 等待模块搜星
+    delay(60000); // 延长等待到 60 秒，增加首定位成功率
     sim_at_cmd("AT+QGPS?"); // 查询 GPS 状态
     sim_at_cmd("AT+QGPSLOC=0"); // Nhận thông tin GPS
 }
@@ -119,7 +119,7 @@ void loop() {
         char c = Serial.read(); // 读取单个字符
         simSerial.write(c); // 透传给模块，实现命令行交互
     }
-    sim_at_cmd("AT+QGPSLOC=0");// đọc lại vị trí GPS sau 5S
-    delay(5000); // 每 5 秒刷新一次定位
+    sim_at_cmd("AT+QGPSLOC=0");// đọc lại vị trí GPS sau 30S
+    delay(30000); // 延长刷新周期，给模块更多时间收星
 
 }
