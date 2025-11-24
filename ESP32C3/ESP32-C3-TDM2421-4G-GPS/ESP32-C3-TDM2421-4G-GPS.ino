@@ -89,6 +89,44 @@ struct GpsFix {
 
 unsigned long lastGeoSensorPush = 0;
 WiFiClientSecure geoSecureClient;
+const size_t GEO_SENSOR_BUFFER_CAPACITY = 32;
+GpsFix geoSensorBuffer[GEO_SENSOR_BUFFER_CAPACITY];
+size_t geoSensorBufferStart = 0;
+size_t geoSensorBufferCount = 0;
+
+bool geoSensorBufferEmpty() {
+    return geoSensorBufferCount == 0;
+}
+
+size_t geoSensorBufferIndex(size_t offset) {
+    return (geoSensorBufferStart + offset) % GEO_SENSOR_BUFFER_CAPACITY;
+}
+
+void geoSensorBufferDropOldest() {
+    if (geoSensorBufferEmpty()) {
+        return;
+    }
+    geoSensorBufferStart = geoSensorBufferIndex(1);
+    --geoSensorBufferCount;
+}
+
+void geoSensorBufferEnqueue(const GpsFix& fix) {
+    if (geoSensorBufferCount == GEO_SENSOR_BUFFER_CAPACITY) {
+        geoSensorBufferDropOldest();
+    }
+    size_t insertIndex = geoSensorBufferIndex(geoSensorBufferCount);
+    geoSensorBuffer[insertIndex] = fix;
+    ++geoSensorBufferCount;
+    Serial.printf("Buffered geoSensor fix, count=%u\n", static_cast<unsigned>(geoSensorBufferCount));
+}
+
+bool geoSensorBufferPeek(GpsFix& fix) {
+    if (geoSensorBufferEmpty()) {
+        return false;
+    }
+    fix = geoSensorBuffer[geoSensorBufferStart];
+    return true;
+}
 
 
 void sim_at_wait() {
@@ -348,6 +386,28 @@ bool uploadGeoSensor(const GpsFix& fix) {
     return httpCode >= 200 && httpCode < 300;
 }
 
+bool flushGeoSensorBuffer() {
+    if (WiFi.status() != WL_CONNECTED) {
+        return false;
+    }
+    bool uploadedAny = false;
+    while (!geoSensorBufferEmpty()) {
+        GpsFix next;
+        if (!geoSensorBufferPeek(next)) {
+            break;
+        }
+        if (!uploadGeoSensor(next)) {
+            Serial.println("Buffered geoSensor upload failed, will retry later");
+            break;
+        }
+        geoSensorBufferDropOldest();
+        uploadedAny = true;
+        Serial.printf("Buffered geoSensor upload success, remaining=%u\n",
+                      static_cast<unsigned>(geoSensorBufferCount));
+    }
+    return uploadedAny;
+}
+
 void handleGeoSensorUpdate() {
     unsigned long now = millis();
     if (lastGeoSensorPush != 0 && now - lastGeoSensorPush < GEO_SENSOR_UPLOAD_INTERVAL_MS) {
@@ -360,8 +420,20 @@ void handleGeoSensorUpdate() {
         Serial.println("Failed to acquire GPS fix");
         return;
     }
+    bool wifiReady = WiFi.status() == WL_CONNECTED;
+    if (!wifiReady) {
+        Serial.println("WiFi unavailable, buffering fix");
+        geoSensorBufferEnqueue(fix);
+        return;
+    }
+    if (!geoSensorBufferEmpty()) {
+        geoSensorBufferEnqueue(fix);
+        flushGeoSensorBuffer();
+        return;
+    }
     if (!uploadGeoSensor(fix)) {
-        Serial.println("geoSensor upload failed");
+        Serial.println("Immediate geoSensor upload failed, buffering");
+        geoSensorBufferEnqueue(fix);
     } else {
         Serial.println("geoSensor upload success");
     }
@@ -371,6 +443,9 @@ void loop() {
     if (Serial.available()) {
         simSerial.write(Serial.read());
     }
-    ensureWifiConnected();
+    bool wifiReady = ensureWifiConnected();
+    if (wifiReady) {
+        flushGeoSensorBuffer();
+    }
     handleGeoSensorUpdate();
 }
