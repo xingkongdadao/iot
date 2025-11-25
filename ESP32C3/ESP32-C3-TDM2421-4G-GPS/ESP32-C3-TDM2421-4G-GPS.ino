@@ -99,12 +99,13 @@ struct GpsFix {
     float longitude = 0.0f;
     float altitude = 0.0f;
     float speed = 0.0f;
+    uint8_t satelliteCount = 0;
     String dataAcquiredAt;
 };
 
 unsigned long lastGeoSensorPush = 0;
 WiFiClientSecure geoSecureClient;
-const size_t GEO_SENSOR_BUFFER_CAPACITY = 10000;
+const uint16_t GEO_SENSOR_BUFFER_CAPACITY = 512;
 GpsFix geoSensorBuffer[GEO_SENSOR_BUFFER_CAPACITY];
 size_t geoSensorBufferStart = 0;
 size_t geoSensorBufferCount = 0;
@@ -125,7 +126,7 @@ String geoBufferSlotKey(size_t index) {
 
 String serializeGpsFix(const GpsFix& fix) {
     String data;
-    data.reserve(96);
+    data.reserve(112);
     data += String(fix.latitude, 8);
     data += ",";
     data += String(fix.longitude, 8);
@@ -135,20 +136,34 @@ String serializeGpsFix(const GpsFix& fix) {
     data += String(fix.speed, 2);
     data += ",";
     data += fix.dataAcquiredAt;
+    data += ",";
+    data += String(static_cast<unsigned>(fix.satelliteCount));
     return data;
 }
 
 bool deserializeGpsFix(const String& data, GpsFix& fix) {
-    const size_t FIELD_COUNT = 5;
-    String fields[FIELD_COUNT];
-    if (!splitCsvFields(data, fields, FIELD_COUNT)) {
+    const size_t CURRENT_FIELD_COUNT = 6;
+    String fields[CURRENT_FIELD_COUNT];
+    if (splitCsvFields(data, fields, CURRENT_FIELD_COUNT)) {
+        fix.latitude = fields[0].toFloat();
+        fix.longitude = fields[1].toFloat();
+        fix.altitude = fields[2].toFloat();
+        fix.speed = fields[3].toFloat();
+        fix.dataAcquiredAt = fields[4];
+        fix.satelliteCount = static_cast<uint8_t>(fields[5].toInt());
+        return true;
+    }
+    const size_t LEGACY_FIELD_COUNT = 5;
+    String legacyFields[LEGACY_FIELD_COUNT];
+    if (!splitCsvFields(data, legacyFields, LEGACY_FIELD_COUNT)) {
         return false;
     }
-    fix.latitude = fields[0].toFloat();
-    fix.longitude = fields[1].toFloat();
-    fix.altitude = fields[2].toFloat();
-    fix.speed = fields[3].toFloat();
-    fix.dataAcquiredAt = fields[4];
+    fix.latitude = legacyFields[0].toFloat();
+    fix.longitude = legacyFields[1].toFloat();
+    fix.altitude = legacyFields[2].toFloat();
+    fix.speed = legacyFields[3].toFloat();
+    fix.dataAcquiredAt = legacyFields[4];
+    fix.satelliteCount = 0;
     return true;
 }
 
@@ -156,8 +171,8 @@ void persistGeoSensorMetadata() {
     if (!geoPrefsReady) {
         return;
     }
-    geoPrefs.putUChar(GEO_BUFFER_PREF_START_KEY, static_cast<uint8_t>(geoSensorBufferStart));
-    geoPrefs.putUChar(GEO_BUFFER_PREF_COUNT_KEY, static_cast<uint8_t>(geoSensorBufferCount));
+    geoPrefs.putUShort(GEO_BUFFER_PREF_START_KEY, static_cast<uint16_t>(geoSensorBufferStart));
+    geoPrefs.putUShort(GEO_BUFFER_PREF_COUNT_KEY, static_cast<uint16_t>(geoSensorBufferCount));
 }
 
 void persistGeoSensorSlot(size_t index) {
@@ -185,8 +200,8 @@ void initGeoSensorBufferPersistence() {
         return;
     }
     geoPrefsReady = true;
-    size_t storedStart = geoPrefs.getUChar(GEO_BUFFER_PREF_START_KEY, 0);
-    size_t storedCount = geoPrefs.getUChar(GEO_BUFFER_PREF_COUNT_KEY, 0);
+    size_t storedStart = geoPrefs.getUShort(GEO_BUFFER_PREF_START_KEY, 0);
+    size_t storedCount = geoPrefs.getUShort(GEO_BUFFER_PREF_COUNT_KEY, 0);
     if (storedStart >= GEO_SENSOR_BUFFER_CAPACITY) {
         storedStart = 0;
     }
@@ -494,6 +509,7 @@ bool parseGpsResponse(const String& raw, GpsFix& fix) {
     fix.altitude = fields[4].toFloat();
     fix.speed = fields[7].toFloat();
     fix.dataAcquiredAt = buildIso8601UtcFromGps(fields[9], fields[0]);
+    fix.satelliteCount = static_cast<uint8_t>(fields[10].toInt());
     return true;
 }
 
@@ -520,13 +536,17 @@ String formatCoordinate(double value) {
     return String(value, decimals);
 }
 
-String buildGeoSensorPayload(const GpsFix& fix) {
+String buildGeoSensorPayload(const GpsFix& fix, const char* networkSource = nullptr) {
     String payload = "{";
     payload += "\"sensorId\":\"" + String(GEO_SENSOR_ID) + "\",";
     payload += "\"latitude\":" + formatCoordinate(fix.latitude) + ",";
     payload += "\"longitude\":" + formatCoordinate(fix.longitude) + ",";
     payload += "\"altitude\":" + String(fix.altitude, 2) + ",";
     payload += "\"speed\":" + String(fix.speed, 2) + ",";
+    payload += "\"satelliteCount\":" + String(static_cast<unsigned>(fix.satelliteCount)) + ",";
+    if (networkSource != nullptr && networkSource[0] != '\0') {
+        payload += "\"networkSource\":\"" + String(networkSource) + "\",";
+    }
     payload += "\"dataAcquiredAt\":\"" + fix.dataAcquiredAt + "\"";
     payload += "}";
     return payload;
@@ -755,7 +775,7 @@ bool uploadGeoSensorViaCellular(const GpsFix& fix) {
     if (!cellularOpenSocket(parsed)) {
         return false;
     }
-    String payload = buildGeoSensorPayload(fix);
+    String payload = buildGeoSensorPayload(fix, "4g");
     String hostHeader = parsed.host;
     if (parsed.port != 80 && parsed.port != 443) {
         hostHeader += ":" + String(parsed.port);
@@ -798,7 +818,7 @@ bool uploadGeoSensorViaWifi(const GpsFix& fix) {
     http.setTimeout(10000);
 
     String url = String(GEO_SENSOR_API_BASE_URL) + "/device/geoSensor/" + String(GEO_SENSOR_ID) + "/";
-    String payload = buildGeoSensorPayload(fix);
+    String payload = buildGeoSensorPayload(fix, "wifi");
     bool useHttps = url.startsWith("https://");
     bool beginResult = false;
 
