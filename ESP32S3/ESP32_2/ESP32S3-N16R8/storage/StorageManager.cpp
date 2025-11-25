@@ -3,7 +3,7 @@
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 
-#include "Config.h"
+#include "../config/Config.h"
 
 bool saveDataToStorage(float distanceCm, time_t timestamp) {
   DynamicJsonDocument doc(JSON_DOC_SIZE);

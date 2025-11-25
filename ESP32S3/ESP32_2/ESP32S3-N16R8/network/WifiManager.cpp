@@ -3,6 +3,8 @@
 #include <WiFi.h>
 #include <Preferences.h>
 
+#include "../config/Config.h"
+
 namespace {
 Preferences wifiPrefs;
 String activeSsid = DEFAULT_WIFI_SSID;

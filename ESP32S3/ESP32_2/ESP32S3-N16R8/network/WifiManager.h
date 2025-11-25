@@ -2,7 +2,7 @@
 
 #include <Arduino.h>
 #include <WebServer.h>
-#include "Config.h"
+#include "../config/Config.h"
 
 extern WebServer configServer;
 extern bool configPortalActive;

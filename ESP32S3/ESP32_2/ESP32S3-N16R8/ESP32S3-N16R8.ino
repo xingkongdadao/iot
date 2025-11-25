@@ -2,12 +2,12 @@
 #include <LittleFS.h>
 #include <WiFi.h>
 
-#include "Config.h"
-#include "DataCollector.h"
-#include "StorageManager.h"
-#include "TimeUtils.h"
-#include "Uploader.h"
-#include "WifiManager.h"
+#include "config/Config.h"
+#include "collector/DataCollector.h"
+#include "storage/StorageManager.h"
+#include "time/TimeUtils.h"
+#include "upload/Uploader.h"
+#include "network/WifiManager.h"
 
 static unsigned long lastCollectTime = 0;
 static unsigned long lastUploadCheckTime = 0;

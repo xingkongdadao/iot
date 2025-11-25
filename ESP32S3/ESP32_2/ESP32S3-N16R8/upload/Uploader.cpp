@@ -4,9 +4,9 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 
-#include "Config.h"
-#include "StorageManager.h"
-#include "TimeUtils.h"
+#include "../config/Config.h"
+#include "../storage/StorageManager.h"
+#include "../time/TimeUtils.h"
 
 bool isUploading = false;
 

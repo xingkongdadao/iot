@@ -3,7 +3,7 @@
 #include <WiFi.h>
 #include <time.h>
 
-#include "Config.h"
+#include "../config/Config.h"
 
 bool timeSynced = false;
 
