@@ -65,6 +65,7 @@ void loop() {
     // 主循环中保持串口转发、网络连通以及上传逻辑
     forwardUsbToModem();
     WifiManager::ensureConnected();
+    WifiManager::loop();
     GeoUploader::flushBuffer();
     GeoUploader::handleUpdate();
 }
