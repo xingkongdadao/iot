@@ -1,0 +1,11 @@
+#include "cellular/CellularClient.cpp"
+#include "gps/GpsService.cpp"
+#include "modem/ModemCommands.cpp"
+#include "net/GeoPayload.cpp"
+#include "net/GeoUploader.cpp"
+#include "net/UrlParser.cpp"
+#include "net/WifiUploader.cpp"
+#include "storage/GeoBuffer.cpp"
+#include "utils/StringUtils.cpp"
+#include "wifi/WifiManager.cpp"
+
