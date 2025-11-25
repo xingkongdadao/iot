@@ -11,16 +11,19 @@ Preferences wifiPrefs;
 WebServer portalServer(80);
 bool portalRunning = false;
 bool credentialsAvailable = false;
+bool portalRoutesConfigured = false;
+bool configApStarted = false;
 String configuredSsid;
 String configuredPassword;
 unsigned long portalLastActivity = 0;
+unsigned long lastConfigApAttempt = 0;
 
 constexpr char PREF_NAMESPACE[] = "wifi";
 constexpr char PREF_SSID_KEY[] = "ssid";
 constexpr char PREF_PASSWORD_KEY[] = "pass";
-constexpr uint32_t PORTAL_TIMEOUT_MS = 300000;  // 5 minutes
 constexpr char AP_SSID[] = "gogotrans_wifi_setup";
 constexpr char AP_PASSWORD[] = "12345678";
+constexpr uint32_t CONFIG_AP_RETRY_INTERVAL_MS = 5000;
 
 const char* wifiStatusToString(wl_status_t status) {
     switch (status) {
@@ -44,10 +47,48 @@ const char* wifiStatusToString(wl_status_t status) {
 }
 
 void configureWifiStack() {
-    WiFi.mode(WIFI_STA);
+    WiFi.mode(WIFI_AP_STA);
     WiFi.persistent(false);
     WiFi.setAutoReconnect(true);
     WiFi.setSleep(false);
+}
+
+void announcePortalAccess() {
+    Serial.printf("Config portal SSID '%s' (password: %s)\n", AP_SSID, AP_PASSWORD);
+    Serial.print("Connect and open http://");
+    Serial.print(WiFi.softAPIP());
+    Serial.println(" to update Wi-Fi.");
+}
+
+void ensureConfigAP() {
+    wifi_mode_t mode = WiFi.getMode();
+    bool apModeActive = (mode == WIFI_AP || mode == WIFI_AP_STA);
+
+    if (configApStarted && apModeActive) {
+        return;
+    }
+
+    if (!apModeActive) {
+        configApStarted = false;
+        WiFi.mode(WIFI_AP_STA);
+    }
+
+    unsigned long now = millis();
+    if (!configApStarted && (now - lastConfigApAttempt) < CONFIG_AP_RETRY_INTERVAL_MS) {
+        return;
+    }
+    lastConfigApAttempt = now;
+
+    if (!WiFi.softAP(AP_SSID, AP_PASSWORD)) {
+        Serial.println("Failed to start config AP, will retry shortly.");
+        configApStarted = false;
+        return;
+    }
+
+    configApStarted = true;
+    Serial.print("Config AP active. IP: ");
+    Serial.println(WiFi.softAPIP());
+    announcePortalAccess();
 }
 
 void loadStoredCredentials() {
@@ -82,6 +123,13 @@ String htmlPage(const String& message) {
     if (!message.isEmpty()) {
         page += "<p style='color:#0969da;margin-bottom:12px;'>" + message + "</p>";
     }
+    if (WiFi.status() == WL_CONNECTED) {
+        page += "<p style='color:#28a745;'>已连接网络，IP: " + WiFi.localIP().toString() + "</p>";
+    } else {
+        page += "<p style='color:#d73a49;'>当前未连接到路由器。</p>";
+    }
+    page += "<p style='margin-top:8px;color:#57606a;'>配置热点: <strong>" + String(AP_SSID) +
+            "</strong><br/>连接后访问 <strong>http://" + WiFi.softAPIP().toString() + "</strong></p>";
     page += "<form method='POST' action='/configure'>"
             "<label>Wi-Fi 名称 (SSID)</label>"
             "<input name='ssid' value='" + configuredSsid + "' required />"
@@ -114,6 +162,9 @@ void handleConfigSubmit() {
 }
 
 void configurePortalRoutes() {
+    if (portalRoutesConfigured) {
+        return;
+    }
     portalServer.on("/", HTTP_GET, []() {
         sendPortalPage();
     });
@@ -121,43 +172,28 @@ void configurePortalRoutes() {
     portalServer.onNotFound([]() {
         portalServer.send(404, "text/plain", "Not found");
     });
+    portalRoutesConfigured = true;
 }
 
 void startConfigPortal() {
+    ensureConfigAP();
+    configurePortalRoutes();
     if (portalRunning) {
         return;
     }
-    Serial.println("Starting Wi-Fi setup portal...");
-    WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP(AP_SSID, AP_PASSWORD);
-    configurePortalRoutes();
+    Serial.println("Ensuring Wi-Fi setup portal is running...");
     portalServer.begin();
     portalRunning = true;
     portalLastActivity = millis();
-    Serial.printf("Portal ready. Connect to SSID '%s' (password: %s)\n", AP_SSID, AP_PASSWORD);
-    Serial.println("Open http://192.168.4.1 in your browser to configure Wi-Fi.");
-}
-
-void stopConfigPortal() {
-    if (!portalRunning) {
-        return;
-    }
-    Serial.println("Stopping Wi-Fi setup portal...");
-    portalServer.stop();
-    WiFi.softAPdisconnect(true);
-    portalRunning = false;
-    configureWifiStack();
+    announcePortalAccess();
 }
 
 void handlePortalLoop() {
     if (!portalRunning) {
         return;
     }
+    ensureConfigAP();
     portalServer.handleClient();
-    if (millis() - portalLastActivity > PORTAL_TIMEOUT_MS && credentialsAvailable) {
-        Serial.println("Portal timeout reached, stopping portal.");
-        stopConfigPortal();
-    }
 }
 
 }  // namespace
@@ -167,9 +203,7 @@ namespace WifiManager {
 void begin() {
     configureWifiStack();
     loadStoredCredentials();
-    if (!credentialsAvailable) {
-        startConfigPortal();
-    }
+    startConfigPortal();
 }
 
 bool ensureConnected() {
@@ -180,6 +214,7 @@ bool ensureConnected() {
         startConfigPortal();
         return false;
     }
+    startConfigPortal();
     if (WiFi.status() == WL_CONNECTED) {
         return true;
     }
@@ -203,7 +238,6 @@ bool ensureConnected() {
             Serial.println(WiFi.RSSI());
             Serial.print("MAC Address: ");
             Serial.println(WiFi.macAddress());
-            stopConfigPortal();
             wifiNextRetryAt = 0;
             return true;
         }
@@ -218,6 +252,7 @@ bool ensureConnected() {
 }
 
 void loop() {
+    startConfigPortal();
     handlePortalLoop();
     if (portalRunning && credentialsAvailable && WiFi.status() != WL_CONNECTED) {
         ensureConnected();
