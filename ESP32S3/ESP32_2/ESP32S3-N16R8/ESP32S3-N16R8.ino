@@ -61,6 +61,7 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   delay(100);
+  beginConfigServer();
 
   bool wifiConnected = connectWiFi();
 
@@ -97,8 +98,9 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
+  handleConfigServer();
+
   if (configPortalActive) {
-    configServer.handleClient();
     if (CONFIG_PORTAL_TIMEOUT_MS > 0 &&
         (now - configPortalLastActivity) > CONFIG_PORTAL_TIMEOUT_MS) {
       Serial.println("[WiFi] 配置模式超时，重启设备重试");
@@ -114,6 +116,7 @@ void loop() {
 
   if (isConnected && !wasConnected) {
     Serial.println("\n[网络] WiFi 已恢复连接");
+    announceConfigServerAddress();
     if (!timeSynced) {
       syncNTPTime();
     }

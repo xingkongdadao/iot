@@ -10,12 +10,51 @@ Preferences wifiPrefs;
 String activeSsid = DEFAULT_WIFI_SSID;
 String activePassword = DEFAULT_WIFI_PASSWORD;
 bool storedCredentialsAvailable = false;
+bool configServerInitialized = false;
+bool configServerRunning = false;
+
+void ensureConfigServerRoutes() {
+  if (configServerInitialized) {
+    return;
+  }
+  configServer.on("/", HTTP_GET, handleConfigPortalRoot);
+  configServer.on("/save", HTTP_POST, handleConfigPortalSave);
+  configServer.onNotFound(handleConfigPortalNotFound);
+  configServerInitialized = true;
+}
 }  // namespace
 
 WebServer configServer(80);
 bool configPortalActive = false;
 unsigned long configPortalStartTime = 0;
 unsigned long configPortalLastActivity = 0;
+
+void announceConfigServerAddress() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  Serial.print("[WiFi] 手机端可访问 http://");
+  Serial.print(WiFi.localIP());
+  Serial.println(" 修改 Wi-Fi 配置");
+}
+
+void beginConfigServer() {
+  ensureConfigServerRoutes();
+  if (configServerRunning) {
+    return;
+  }
+  configServer.begin();
+  configServerRunning = true;
+  Serial.println("[WiFi] Web 配置服务已启动，可随时通过浏览器修改 Wi-Fi");
+  announceConfigServerAddress();
+}
+
+void handleConfigServer() {
+  if (!configServerRunning) {
+    return;
+  }
+  configServer.handleClient();
+}
 
 const String& getActiveSsid() {
   return activeSsid;
@@ -79,7 +118,16 @@ void sendConfigPortalPage(const String& message) {
       "border:1px solid #ccc;border-radius:6px;}button{background:#0070f3;color:#fff;border:none;"
       "font-size:16px;cursor:pointer;}button:hover{background:#005ad1;}label{font-weight:600;}"
       ".msg{margin-top:12px;color:#d9534f;font-weight:600;text-align:center;}"
-      "</style></head><body><div class='container'><h2>配置 Wi-Fi</h2>"
+      "</style></head><body><div class='container'><h2>配置 Wi-Fi</h2>");
+  html += "<p style='font-size:14px;color:#555;'>当前网络: <strong>" +
+          (hasStoredCredentials() ? activeSsid
+                                  : String("(默认)") + activeSsid) +
+          "</strong></p>";
+  if (WiFi.status() == WL_CONNECTED) {
+    html += "<p style='font-size:14px;color:#555;'>设备 IP: <strong>" +
+            WiFi.localIP().toString() + "</strong></p>";
+  }
+  html += F(
       "<form method='POST' action='/save'><label>Wi-Fi 名称 (SSID)</label>"
       "<input name='ssid' placeholder='如：MyHomeWiFi' required>"
       "<label>Wi-Fi 密码</label><input name='password' type='password'"
@@ -137,6 +185,7 @@ void startConfigPortal() {
   if (configPortalActive) {
     return;
   }
+  beginConfigServer();
   configPortalActive = true;
   configPortalStartTime = millis();
   configPortalLastActivity = configPortalStartTime;
@@ -147,11 +196,6 @@ void startConfigPortal() {
 
   bool apStarted = WiFi.softAP(CONFIG_AP_SSID, CONFIG_AP_PASSWORD);
   IPAddress apIP = WiFi.softAPIP();
-
-  configServer.on("/", HTTP_GET, handleConfigPortalRoot);
-  configServer.on("/save", HTTP_POST, handleConfigPortalSave);
-  configServer.onNotFound(handleConfigPortalNotFound);
-  configServer.begin();
 
   Serial.println("\n[WiFi] 进入配置模式");
   if (apStarted) {

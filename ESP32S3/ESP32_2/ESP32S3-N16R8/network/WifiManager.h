@@ -17,6 +17,9 @@ void sendConfigPortalPage(const String& message = "");
 void handleConfigPortalRoot();
 void handleConfigPortalSave();
 void handleConfigPortalNotFound();
+void beginConfigServer();
+void handleConfigServer();
+void announceConfigServerAddress();
 
 const String& getActiveSsid();
 const String& getActivePassword();
