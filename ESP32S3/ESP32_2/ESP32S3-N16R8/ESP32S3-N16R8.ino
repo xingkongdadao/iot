@@ -1,5 +1,5 @@
 /*
- * ESP32 数据收集与上传程序（ ESP32S3-N16R8 ）
+ * ESP32 数据收集与上传程序（ ESP32S3N16R8 ）
  * ----------------------------------------
  * 功能：
  * - 每5秒收集一条数据（模拟长度 + 日期时间含时区）
@@ -25,7 +25,7 @@
 
 // WiFi 配置（与 ESP32_1.ino 保持一致）
 const char* defaultWifiSsid = "GOGOTRANS";
-const char* defaultWifiPassword = "18621260183";
+const char* defaultWifiPassword = "186212601830";
 
 Preferences wifiPrefs;
 String activeSsid = defaultWifiSsid;
