@@ -16,25 +16,30 @@
 #define MCU_LED                   10 // 板载 LED 管脚
 #define PHONE_NUMBER            "0..." // 发送短信的目标手机号
 #define GEO_SENSOR_UPLOAD_INTERVAL_MS 6000UL // geoSensor 上传周期（5 分钟）
-
-const char* GEO_SENSOR_API_BASE_URL = "http://192.168.100.192:8001/api"; // 本地测试地址，与 ESP32_2.ino 一致
-// const char* GEO_SENSOR_API_BASE_URL = "https://manage.gogotrans.com/api"; // 生产环境地址
+// const char* GEO_SENSOR_API_BASE_URL = "http://42.1.94.213:8001//api"; // 本地测试地址，与 ESP32_2.ino 一致
+// const char* GEO_SENSOR_API_BASE_URL = "http://192.168.100.192:8001/api"; // 本地测试地址，与 ESP32_2.ino 一致
+const char* GEO_SENSOR_API_BASE_URL = "https://manage.gogotrans.com/api"; // 生产环境地址
 const char* GEO_SENSOR_KEY = "mcu_0fda5a6b27214e1eb30fe7fe2c5d4f69"; // 接口 key
 const char* GEO_SENSOR_ID = "4ccd94bc-c947-11f0-9ea2-12d3851b737f"; // GPS 传感器 ID
 // Thay bằng thông tin WiFi của bạn
 const char* ssid = "GOGOTRANS";        // 目标 Wi-Fi SSID
 const char* password = "18621260183"; // 目标 Wi-Fi 密码
+const bool WIFI_ENABLED = true;       // 可选：false 时跳过 Wi-Fi，直接使用 4G
 const uint8_t WIFI_MAX_ATTEMPTS = 5;
 const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
+const uint32_t WIFI_RETRY_COOLDOWN_MS = 60000; // Wi-Fi 失败后暂停重试 60 秒
 const uint32_t GEO_SENSOR_BACKOFF_DELAYS_MS[] = {5000UL, 60000UL, 300000UL}; // 5 秒 -> 1 分钟 -> 5 分钟
 const size_t GEO_SENSOR_BACKOFF_STAGE_COUNT =
     sizeof(GEO_SENSOR_BACKOFF_DELAYS_MS) / sizeof(GEO_SENSOR_BACKOFF_DELAYS_MS[0]);
+unsigned long wifiNextRetryAt = 0;
 const char* CELL_APN = "CMNET"; // 根据 SIM 卡运营商调整
 const char* CELL_APN_USER = ""; // 若无需鉴权则留空
 const char* CELL_APN_PASS = "";
 const uint8_t CELL_CONTEXT_ID = 1;
 const uint8_t CELL_SOCKET_ID = 0;
 const uint32_t CELL_ATTACH_TIMEOUT_MS = 60000;
+const uint32_t CELL_SIM_READY_TIMEOUT_MS = 20000;
+const uint32_t CELL_REG_CHECK_INTERVAL_MS = 2000;
 const uint32_t CELL_READY_REFRESH_MS = 300000;
 const uint32_t CELL_SOCKET_OP_TIMEOUT_MS = 20000;
 const uint16_t CELL_HTTP_READ_CHUNK = 512;
@@ -64,8 +69,14 @@ const char* wifiStatusToString(wl_status_t status) {
 }
 
 bool ensureWifiConnected() {
+    if (!WIFI_ENABLED) {
+        return false;
+    }
     if (WiFi.status() == WL_CONNECTED) {
         return true;
+    }
+    if (wifiNextRetryAt != 0 && millis() < wifiNextRetryAt) {
+        return false;
     }
     WiFi.mode(WIFI_STA);
     WiFi.persistent(false);
@@ -85,12 +96,14 @@ bool ensureWifiConnected() {
             Serial.println(WiFi.RSSI());
             Serial.print("MAC Address: ");
             Serial.println(WiFi.macAddress());
+            wifiNextRetryAt = 0;
             return true;
         }
         Serial.printf("WiFi connect failed -> status: %s (%d)\n", wifiStatusToString(result), result);
         delay(1000);
     }
     Serial.println("WiFi connection timeout after max attempts");
+    wifiNextRetryAt = millis() + WIFI_RETRY_COOLDOWN_MS;
     return false;
 }
 
@@ -599,6 +612,42 @@ bool qiactResponseHasContext(const String& response) {
     return response.indexOf(needle) != -1;
 }
 
+bool waitForSimReady(uint32_t timeoutMs) {
+    unsigned long start = millis();
+    while (millis() - start < timeoutMs) {
+        String response;
+        if (sim_at_cmd_with_response("AT+CPIN?", response, 2000) && response.indexOf("READY") != -1) {
+            Serial.println("SIM ready");
+            return true;
+        }
+        delay(1000);
+    }
+    Serial.println("SIM not ready before timeout");
+    return false;
+}
+
+bool registrationIndicatesAttached(const String& response) {
+    return response.indexOf("0,1") != -1 || response.indexOf("0,5") != -1;
+}
+
+bool waitForCellularRegistration(uint32_t timeoutMs) {
+    const char* REG_COMMANDS[] = {"AT+CREG?", "AT+CGREG?", "AT+CEREG?"};
+    unsigned long start = millis();
+    while (millis() - start < timeoutMs) {
+        for (size_t i = 0; i < sizeof(REG_COMMANDS) / sizeof(REG_COMMANDS[0]); ++i) {
+            String response;
+            if (sim_at_cmd_with_response(REG_COMMANDS[i], response, 3000) &&
+                registrationIndicatesAttached(response)) {
+                Serial.printf("Network attached via %s -> %s\n", REG_COMMANDS[i], response.c_str());
+                return true;
+            }
+        }
+        delay(CELL_REG_CHECK_INTERVAL_MS);
+    }
+    Serial.println("Network registration timeout");
+    return false;
+}
+
 bool ensureCellularReady() {
     if (CELL_APN == nullptr || strlen(CELL_APN) == 0) {
         return false;
@@ -611,13 +660,36 @@ bool ensureCellularReady() {
         Serial.println("Cellular module not responding to AT");
         return false;
     }
-    String apnCmd = "AT+QICSGP=" + String(CELL_CONTEXT_ID) + ",1,\"" + String(CELL_APN) + "\",\"" +
-                    String(CELL_APN_USER) + "\",\"" + String(CELL_APN_PASS) + "\",1";
-    if (!sim_at_cmd_with_response(apnCmd, response, 5000)) {
-        Serial.println("Failed to configure APN");
+    sim_at_cmd_with_response("ATE0", response, 2000);
+    if (!sim_at_cmd_with_response("AT+CFUN=1", response, 10000)) {
+        Serial.println("Failed to set CFUN=1");
         return false;
     }
-    if (!sim_at_cmd_with_response("AT+QIACT?", response, 5000) || !qiactResponseHasContext(response)) {
+    sim_at_cmd_with_response("AT+QCFG=\"roamservice\",2", response, 5000);
+    if (!waitForSimReady(CELL_SIM_READY_TIMEOUT_MS)) {
+        return false;
+    }
+    if (!waitForCellularRegistration(CELL_ATTACH_TIMEOUT_MS)) {
+        return false;
+    }
+    bool contextActive = false;
+    if (sim_at_cmd_with_response("AT+QIACT?", response, 5000)) {
+        contextActive = qiactResponseHasContext(response);
+    }
+    if (!contextActive) {
+        String deactivateCmd = "AT+QIDEACT=" + String(CELL_CONTEXT_ID);
+        sim_at_cmd_with_response(deactivateCmd, response, 10000);
+        String pdpCmd = "AT+CGDCONT=" + String(CELL_CONTEXT_ID) + ",\"IP\",\"" + String(CELL_APN) + "\"";
+        if (!sim_at_cmd_with_response(pdpCmd, response, 5000)) {
+            Serial.println("Failed to set PDP context");
+            return false;
+        }
+        String apnCmd = "AT+QICSGP=" + String(CELL_CONTEXT_ID) + ",1,\"" + String(CELL_APN) + "\",\"" +
+                        String(CELL_APN_USER) + "\",\"" + String(CELL_APN_PASS) + "\",1";
+        if (!sim_at_cmd_with_response(apnCmd, response, 5000)) {
+            Serial.println("Failed to configure APN");
+            return false;
+        }
         String actCmd = "AT+QIACT=" + String(CELL_CONTEXT_ID);
         if (!sim_at_cmd_with_response(actCmd, response, CELL_ATTACH_TIMEOUT_MS)) {
             Serial.println("Failed to activate PDP context");
