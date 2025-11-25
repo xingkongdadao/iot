@@ -1,5 +1,5 @@
 /*
- * ESP32 数据收集与上传程序（ESP32_2）
+ * ESP32 数据收集与上传程序（ ESP32S3-N16R8 ）
  * ----------------------------------------
  * 功能：
  * - 每5秒收集一条数据（模拟长度 + 日期时间含时区）
@@ -20,10 +20,168 @@
 #include <time.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
+#include <WebServer.h>
 
 // WiFi 配置（与 ESP32_1.ino 保持一致）
-const char* ssid = "GOGOTRANS";
-const char* password = "18621260183";
+const char* defaultWifiSsid = "GOGOTRANS";
+const char* defaultWifiPassword = "18621260183";
+
+Preferences wifiPrefs;
+String activeSsid = defaultWifiSsid;
+String activePassword = defaultWifiPassword;
+bool storedCredentialsAvailable = false;
+
+constexpr char WIFI_PREF_NAMESPACE[] = "wifi";
+constexpr char WIFI_PREF_SSID_KEY[] = "ssid";
+constexpr char WIFI_PREF_PASS_KEY[] = "pass";
+
+constexpr char CONFIG_AP_SSID[] = "ESP32S3_Config";
+constexpr char CONFIG_AP_PASSWORD[] = "12345678";
+constexpr unsigned long CONFIG_PORTAL_TIMEOUT_MS = 10UL * 60UL * 1000UL;  // 10分钟
+
+WebServer configServer(80);
+bool configPortalActive = false;
+unsigned long configPortalStartTime = 0;
+unsigned long configPortalLastActivity = 0;
+
+void loadStoredWiFiCredentials() {
+  storedCredentialsAvailable = false;
+  if (wifiPrefs.begin(WIFI_PREF_NAMESPACE, true)) {
+    String storedSsid = wifiPrefs.getString(WIFI_PREF_SSID_KEY, "");
+    String storedPass = wifiPrefs.getString(WIFI_PREF_PASS_KEY, "");
+    wifiPrefs.end();
+
+    storedSsid.trim();
+    storedPass.trim();
+
+    if (storedSsid.length() > 0) {
+      activeSsid = storedSsid;
+      activePassword = storedPass;
+      storedCredentialsAvailable = true;
+      Serial.println("[WiFi] 已加载保存的 Wi-Fi 配置信息");
+      return;
+    }
+  }
+
+  activeSsid = defaultWifiSsid;
+  activePassword = defaultWifiPassword;
+  Serial.println("[WiFi] 使用默认的 Wi-Fi 配置信息");
+}
+
+bool persistWiFiCredentials(const String& newSsid, const String& newPassword) {
+  if (!wifiPrefs.begin(WIFI_PREF_NAMESPACE, false)) {
+    return false;
+  }
+  bool ok = wifiPrefs.putString(WIFI_PREF_SSID_KEY, newSsid) &&
+            wifiPrefs.putString(WIFI_PREF_PASS_KEY, newPassword);
+  wifiPrefs.end();
+  if (ok) {
+    activeSsid = newSsid;
+    activePassword = newPassword;
+    storedCredentialsAvailable = true;
+  }
+  return ok;
+}
+
+void sendConfigPortalPage(const String& message = "") {
+  String html = F(
+      "<!DOCTYPE html><html><head><meta charset='utf-8'/>"
+      "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
+      "<title>ESP32 Wi-Fi 设置</title>"
+      "<style>body{font-family:Arial;background:#f5f5f5;margin:0;padding:0;color:#333;}"
+      ".container{max-width:420px;margin:40px auto;padding:24px;background:#fff;border-radius:8px;"
+      "box-shadow:0 4px 12px rgba(0,0,0,0.08);}input,button{width:100%;padding:12px;margin:8px 0;"
+      "border:1px solid #ccc;border-radius:6px;}button{background:#0070f3;color:#fff;border:none;"
+      "font-size:16px;cursor:pointer;}button:hover{background:#005ad1;}label{font-weight:600;}"
+      ".msg{margin-top:12px;color:#d9534f;font-weight:600;text-align:center;}"
+      "</style></head><body><div class='container'><h2>配置 Wi-Fi</h2>"
+      "<form method='POST' action='/save'><label>Wi-Fi 名称 (SSID)</label>"
+      "<input name='ssid' placeholder='如：MyHomeWiFi' required>"
+      "<label>Wi-Fi 密码</label><input name='password' type='password'"
+      "placeholder='至少8位（如有）'>"
+      "<button type='submit'>保存并重启</button></form>");
+  if (message.length() > 0) {
+    html += "<div class='msg'>" + message + "</div>";
+  }
+  html += F("<p style='font-size:12px;color:#777;margin-top:16px;'>保存后设备将自动重启，"
+            "并尝试连接到新的 Wi-Fi。</p></div></body></html>");
+  configServer.send(200, "text/html", html);
+}
+
+void handleConfigPortalRoot() {
+  configPortalLastActivity = millis();
+  sendConfigPortalPage();
+}
+
+void handleConfigPortalSave() {
+  configPortalLastActivity = millis();
+  if (!configServer.hasArg("ssid")) {
+    sendConfigPortalPage("请填写 Wi-Fi 名称");
+    return;
+  }
+
+  String newSsid = configServer.arg("ssid");
+  String newPassword = configServer.arg("password");
+  newSsid.trim();
+  newPassword.trim();
+
+  if (newSsid.isEmpty()) {
+    sendConfigPortalPage("Wi-Fi 名称不能为空");
+    return;
+  }
+
+  if (!persistWiFiCredentials(newSsid, newPassword)) {
+    sendConfigPortalPage("保存失败，请重试");
+    return;
+  }
+
+  configServer.send(200, "text/plain",
+                    "Wi-Fi 配置已保存，设备即将重启并连接到新网络。");
+  Serial.println("[WiFi] 已保存新的 Wi-Fi 配置，准备重启...");
+  delay(1500);
+  ESP.restart();
+}
+
+void handleConfigPortalNotFound() {
+  configPortalLastActivity = millis();
+  configServer.sendHeader("Location", "/", true);
+  configServer.send(302, "text/plain", "");
+}
+
+void startConfigPortal() {
+  if (configPortalActive) {
+    return;
+  }
+  configPortalActive = true;
+  configPortalStartTime = millis();
+  configPortalLastActivity = configPortalStartTime;
+
+  WiFi.disconnect(true, true);
+  delay(100);
+  WiFi.mode(WIFI_AP);
+
+  bool apStarted = WiFi.softAP(CONFIG_AP_SSID, CONFIG_AP_PASSWORD);
+  IPAddress apIP = WiFi.softAPIP();
+
+  configServer.on("/", HTTP_GET, handleConfigPortalRoot);
+  configServer.on("/save", HTTP_POST, handleConfigPortalSave);
+  configServer.onNotFound(handleConfigPortalNotFound);
+  configServer.begin();
+
+  Serial.println("\n[WiFi] 进入配置模式");
+  if (apStarted) {
+    Serial.print("[WiFi] 配置热点: ");
+    Serial.print(CONFIG_AP_SSID);
+    Serial.print(" / 密码: ");
+    Serial.println(CONFIG_AP_PASSWORD);
+    Serial.print("[WiFi] 使用手机连接后，访问 http://");
+    Serial.print(apIP.toString());
+    Serial.println(" 进行配置");
+  } else {
+    Serial.println("[WiFi] 启动配置热点失败");
+  }
+}
 
 // API 配置（与 ESP32_1.ino 保持一致）
 // 本地测试地址：http://192.168.100.193:8001/api
@@ -57,11 +215,14 @@ const size_t minFreeHeap = 20000;                // 最小可用堆内存阈值�
 const size_t JSON_DOC_SIZE = 1048576;            // JSON 文档大小（1MB），可存储约52400条数据
 
 // 连接 WiFi
-void connectWiFi() {
+bool connectWiFi() {
   Serial.print("[WiFi] 正在连接: ");
-  Serial.println(ssid);
-  
-  WiFi.begin(ssid, password);
+  Serial.println(activeSsid);
+  if (storedCredentialsAvailable) {
+    Serial.println("[WiFi] 使用已保存的网络配置");
+  }
+
+  WiFi.begin(activeSsid.c_str(), activePassword.c_str());
 
   int attempts = 0;
   const int maxAttempts = 20;  // 最多尝试20次（10秒）
@@ -80,8 +241,10 @@ void connectWiFi() {
     Serial.print("[WiFi] 信号强度: ");
     Serial.print(WiFi.RSSI());
     Serial.println(" dBm");
+    return true;
   } else {
-    Serial.println("[WiFi] ✗ 连接失败，将在loop中继续尝试重连...");
+    Serial.println("[WiFi] ✗ 连接失败，将在 loop 中继续尝试或进入配置模式");
+    return false;
   }
 }
 
@@ -693,17 +856,22 @@ void setup() {
     Serial.println("[存储] 无未上传的数据");
   }
 
+  loadStoredWiFiCredentials();
+
   // 初始化 WiFi
   Serial.println("[WiFi] 初始化 WiFi...");
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   delay(100);
-  
-  connectWiFi();
+
+  bool wifiConnected = connectWiFi();
 
   // 如果 WiFi 连接成功，同步 NTP 时间
-  if (WiFi.status() == WL_CONNECTED) {
+  if (wifiConnected) {
     syncNTPTime();
+  } else {
+    Serial.println("[WiFi] Wi-Fi 连接失败，自动进入配置模式");
+    startConfigPortal();
   }
 
   // 初始化数据收集时间
@@ -732,6 +900,18 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
+
+  if (configPortalActive) {
+    configServer.handleClient();
+    if (CONFIG_PORTAL_TIMEOUT_MS > 0 &&
+        (now - configPortalLastActivity) > CONFIG_PORTAL_TIMEOUT_MS) {
+      Serial.println("[WiFi] 配置模式超时，重启设备重试");
+      delay(1000);
+      ESP.restart();
+    }
+    delay(20);
+    return;
+  }
   
   // 检查 WiFi 连接状态
   static bool wasConnected = false;
@@ -751,7 +931,10 @@ void loop() {
     if (now - lastReconnectAttempt >= 10000) {  // 每10秒尝试重连一次
       lastReconnectAttempt = now;
       Serial.println("[WiFi] 连接断开，正在重连...");
-      connectWiFi();
+      if (!connectWiFi()) {
+        Serial.println("[WiFi] 无法重连，进入 Wi-Fi 配置模式");
+        startConfigPortal();
+      }
       if (WiFi.status() == WL_CONNECTED && !timeSynced) {
         syncNTPTime();
       }
