@@ -20,6 +20,7 @@ void handleConfigPortalNotFound();
 void beginConfigServer();
 void handleConfigServer();
 void announceConfigServerAddress();
+void ensureConfigAP();
 
 const String& getActiveSsid();
 const String& getActivePassword();

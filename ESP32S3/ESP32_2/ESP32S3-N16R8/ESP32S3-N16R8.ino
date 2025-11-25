@@ -58,9 +58,10 @@ void setup() {
   loadStoredWiFiCredentials();
 
   Serial.println("[WiFi] 初始化 WiFi...");
-  WiFi.mode(WIFI_STA);
+  WiFi.mode(WIFI_AP_STA);
   WiFi.disconnect();
   delay(100);
+  ensureConfigAP();
   beginConfigServer();
 
   bool wifiConnected = connectWiFi();
@@ -97,6 +98,7 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
+  ensureConfigAP();
 
   handleConfigServer();
 

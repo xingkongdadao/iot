@@ -12,6 +12,8 @@ String activePassword = DEFAULT_WIFI_PASSWORD;
 bool storedCredentialsAvailable = false;
 bool configServerInitialized = false;
 bool configServerRunning = false;
+bool configApStarted = false;
+unsigned long lastConfigApAttempt = 0;
 
 void ensureConfigServerRoutes() {
   if (configServerInitialized) {
@@ -28,6 +30,44 @@ WebServer configServer(80);
 bool configPortalActive = false;
 unsigned long configPortalStartTime = 0;
 unsigned long configPortalLastActivity = 0;
+
+void ensureConfigAP() {
+  wifi_mode_t mode = WiFi.getMode();
+  bool apModeActive = (mode == WIFI_AP || mode == WIFI_AP_STA);
+
+  if (configApStarted && apModeActive) {
+    return;
+  }
+
+  if (!apModeActive) {
+    configApStarted = false;
+    WiFi.mode(WIFI_AP_STA);
+  }
+
+  unsigned long now = millis();
+  if (!configApStarted && (now - lastConfigApAttempt) < 5000) {
+    return;
+  }
+  lastConfigApAttempt = now;
+
+  bool apStarted = WiFi.softAP(CONFIG_AP_SSID, CONFIG_AP_PASSWORD);
+  if (!apStarted) {
+    Serial.println("[WiFi] 启动配置热点失败，将在稍后重试");
+    configApStarted = false;
+    return;
+  }
+
+  configApStarted = true;
+  IPAddress apIP = WiFi.softAPIP();
+
+  Serial.print("[WiFi] 配置热点常驻: ");
+  Serial.print(CONFIG_AP_SSID);
+  Serial.print(" / 密码: ");
+  Serial.println(CONFIG_AP_PASSWORD);
+  Serial.print("[WiFi] 连接该热点后访问 http://");
+  Serial.print(apIP);
+  Serial.println(" 可随时修改 Wi-Fi");
+}
 
 void announceConfigServerAddress() {
   if (WiFi.status() != WL_CONNECTED) {
@@ -124,9 +164,13 @@ void sendConfigPortalPage(const String& message) {
                                   : String("(默认)") + activeSsid) +
           "</strong></p>";
   if (WiFi.status() == WL_CONNECTED) {
-    html += "<p style='font-size:14px;color:#555;'>设备 IP: <strong>" +
+    html += "<p style='font-size:14px;color:#555;'>局域网 IP: <strong>" +
             WiFi.localIP().toString() + "</strong></p>";
   }
+  IPAddress apIP = WiFi.softAPIP();
+  html += "<p style='font-size:14px;color:#555;'>配置热点: <strong>" +
+          String(CONFIG_AP_SSID) + "</strong> (连接后访问 <strong>http://" +
+          apIP.toString() + "</strong>)</p>";
   html += F(
       "<form method='POST' action='/save'><label>Wi-Fi 名称 (SSID)</label>"
       "<input name='ssid' placeholder='如：MyHomeWiFi' required>"
@@ -185,6 +229,7 @@ void startConfigPortal() {
   if (configPortalActive) {
     return;
   }
+  ensureConfigAP();
   beginConfigServer();
   configPortalActive = true;
   configPortalStartTime = millis();
@@ -192,23 +237,18 @@ void startConfigPortal() {
 
   WiFi.disconnect(true, true);
   delay(100);
-  WiFi.mode(WIFI_AP);
-
-  bool apStarted = WiFi.softAP(CONFIG_AP_SSID, CONFIG_AP_PASSWORD);
   IPAddress apIP = WiFi.softAPIP();
 
   Serial.println("\n[WiFi] 进入配置模式");
-  if (apStarted) {
+  if (configApStarted) {
     Serial.print("[WiFi] 配置热点: ");
     Serial.print(CONFIG_AP_SSID);
     Serial.print(" / 密码: ");
     Serial.println(CONFIG_AP_PASSWORD);
-    Serial.print("[WiFi] 使用手机连接后，访问 http://");
-    Serial.print(apIP.toString());
-    Serial.println(" 进行配置");
-  } else {
-    Serial.println("[WiFi] 启动配置热点失败");
   }
+  Serial.print("[WiFi] 使用手机连接后，访问 http://");
+  Serial.print(apIP.toString());
+  Serial.println(" 进行配置");
 }
 
 bool connectWiFi() {
