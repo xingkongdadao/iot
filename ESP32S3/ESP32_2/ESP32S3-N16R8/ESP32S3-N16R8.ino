@@ -9,6 +9,13 @@
 #include "upload/Uploader.h"
 #include "network/WifiManager.h"
 
+// Arduino 构建系统不会自动编译子目录中的 .cpp 文件，将其直接包含进来
+#include "collector/DataCollector.cpp"
+#include "storage/StorageManager.cpp"
+#include "time/TimeUtils.cpp"
+#include "upload/Uploader.cpp"
+#include "network/WifiManager.cpp"
+
 static unsigned long lastCollectTime = 0;
 static unsigned long lastUploadCheckTime = 0;
 
