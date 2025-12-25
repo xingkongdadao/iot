@@ -22,8 +22,8 @@ inline constexpr char GEO_SENSOR_API_BASE_URL[] = "https://manage.gogotrans.com/
 inline constexpr char GEO_SENSOR_KEY[] = "mcu_0fda5a6b27214e1eb30fe7fe2c5d4f69";
 inline constexpr char GEO_SENSOR_ID[] = "4ccd94bc-c947-11f0-9ea2-12d3851b737f";
 
-inline constexpr char WIFI_SSID[] = "GOGOTRANS";
-inline constexpr char WIFI_PASSWORD[] = "18621260183";
+inline constexpr char WIFI_SSID[] = "米奇";
+inline constexpr char WIFI_PASSWORD[] = "19963209891";
 inline constexpr bool WIFI_ENABLED = true;
 inline constexpr uint8_t WIFI_MAX_ATTEMPTS = 5;
 inline constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;

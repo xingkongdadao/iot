@@ -133,8 +133,8 @@ String htmlPage(const String& message) {
     page += "<form method='POST' action='/configure'>"
             "<label>Wi-Fi 名称 (SSID)</label>"
             "<input name='ssid' value='" + configuredSsid + "' required />"
-            "<label>Wi-Fi 密码</label>"
-            "<input name='password' type='password' value='" + configuredPassword + "' required />"
+            "<label>Wi-Fi 密码 (可留空，表示无密码)</label>"
+            "<input name='password' type='password' value='" + configuredPassword + "' />"
             "<button type='submit'>保存并连接</button>"
             "</form>"
             "<p style='margin-top:16px;color:#57606a;'>保存后设备会自动尝试连接新的 Wi-Fi。</p>"
@@ -150,8 +150,8 @@ void sendPortalPage(const String& message = "") {
 void handleConfigSubmit() {
     const String ssid = portalServer.arg("ssid");
     const String password = portalServer.arg("password");
-    if (ssid.isEmpty() || password.isEmpty()) {
-        sendPortalPage("SSID 和密码不能为空。");
+    if (ssid.isEmpty()) {
+        sendPortalPage("SSID 不能为空。");
         return;
     }
 
@@ -223,11 +223,37 @@ bool ensureConnected() {
     }
 
     configureWifiStack();
+
+    // Scan networks before attempting to connect, to debug visibility and signal
+    Serial.println("Scanning WiFi networks before connect...");
+    int networkCount = WiFi.scanNetworks();
+    Serial.printf("Found %d networks\n", networkCount);
+    bool configuredSsidFound = false;
+    for (int i = 0; i < networkCount; ++i) {
+        String ssid = WiFi.SSID(i);
+        int32_t rssi = WiFi.RSSI(i);
+        wifi_auth_mode_t enc = WiFi.encryptionType(i);
+        Serial.printf("%2d: SSID='%s', RSSI=%d dBm, ENC=%d\n", i, ssid.c_str(), rssi, static_cast<int>(enc));
+        if (ssid == configuredSsid) {
+            configuredSsidFound = true;
+        }
+    }
+    if (!configuredSsidFound) {
+        Serial.printf("Configured SSID '%s' not found in scan results.\n", configuredSsid.c_str());
+    } else {
+        Serial.printf("Configured SSID '%s' detected in scan results.\n", configuredSsid.c_str());
+    }
+
     for (uint8_t attempt = 1; attempt <= AppConfig::WIFI_MAX_ATTEMPTS; ++attempt) {
         Serial.printf("WiFi connect attempt %u/%u\n", attempt, AppConfig::WIFI_MAX_ATTEMPTS);
         WiFi.disconnect(true, true);
         delay(200);
-        WiFi.begin(configuredSsid.c_str(), configuredPassword.c_str());
+        if (configuredPassword.length() == 0) {
+            Serial.printf("Connecting to open network SSID: %s\n", configuredSsid.c_str());
+            WiFi.begin(configuredSsid.c_str());
+        } else {
+            WiFi.begin(configuredSsid.c_str(), configuredPassword.c_str());
+        }
         wl_status_t result =
             static_cast<wl_status_t>(WiFi.waitForConnectResult(AppConfig::WIFI_CONNECT_TIMEOUT_MS));
         if (result == WL_CONNECTED) {
